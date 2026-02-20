@@ -1,0 +1,58 @@
+-- Looker Studio parametreleri: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
+
+WITH
+params AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', @DS_START_DATE) AS ds_start,
+    PARSE_DATE('%Y%m%d', @DS_END_DATE)   AS ds_end
+),
+
+contents AS (
+  SELECT
+    video_id,
+    ANY_VALUE(displayname)     AS displayname,
+    ANY_VALUE(video_name)      AS video_name,
+    ANY_VALUE(season_info)     AS season_info,
+    ANY_VALUE(contenttype_id)  AS contenttype_id,
+    ANY_VALUE(IsGainOriginals) AS IsGainOriginals,
+    ANY_VALUE(genres)          AS genres
+  FROM `microgain-9f959.Backoffice_metadata.ContentMetaData`
+  GROUP BY video_id
+),
+
+base AS (
+  SELECT
+    v.event_date,              -- ✅ Looker’ın tarih boyutu
+    v.user_id,
+    v.video_id,
+    v.ga_session_id
+  FROM `microgain-9f959.looker_report.content_report_streaming_V2` v
+  JOIN params p ON TRUE
+  WHERE v.user_id IS NOT NULL
+    AND v.event_date BETWEEN p.ds_start AND p.ds_end
+)
+
+SELECT
+  b.event_date,                -- ✅ date chart’a bağlanacak alan
+  c.displayname AS content_name,
+  c.season_info AS sezon,
+
+  SAFE_CAST(
+    COALESCE(
+      REGEXP_EXTRACT(LOWER(c.video_name), r'(?:bölüm|bolum|ep|episode)\s*([0-9]{1,3})'),
+      REGEXP_EXTRACT(c.video_name, r'\b([0-9]{1,3})\b')
+    )
+    AS INT64
+  ) AS bolum,
+
+  c.contenttype_id AS icerik_turu,
+  c.genres AS kategori,
+  c.IsGainOriginals,
+
+  COUNT(DISTINCT b.user_id) AS user_cnt,
+  COUNT(DISTINCT CONCAT(b.user_id, b.video_id, b.ga_session_id)) AS view_cnt
+FROM base b
+JOIN contents c ON b.video_id = c.video_id
+GROUP BY
+  b.event_date, content_name, sezon, bolum, icerik_turu, kategori, IsGainOriginals
+ORDER BY view_cnt DESC;
