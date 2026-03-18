@@ -1,7 +1,7 @@
 WITH params AS (
   SELECT
     PARSE_DATE('%Y%m%d', '20251201') AS ds_start,
-    PARSE_DATE('%Y%m%d', '20260401') AS ds_end
+    PARSE_DATE('%Y%m%d', '20260330') AS ds_end
 ),
 
 months AS (
@@ -108,22 +108,26 @@ agg AS (
 )
 
 SELECT
-  m.ay,
-  COALESCE(a.total_subs, 0) AS total_subs,
-  COALESCE(g.trial_users, 0) AS trial_users,
-  COALESCE(g.paid_users, 0) AS paid_users,
+  m.ay AS Tarih,
 
-  SAFE_DIVIDE(COALESCE(g.trial_users, 0), COALESCE(a.total_subs, 0)) AS trial_penetration,
-  SAFE_DIVIDE(COALESCE(g.paid_users, 0), COALESCE(g.trial_users, 0)) AS trial_to_paid_conversion,
-  SAFE_DIVIDE(COALESCE(g.paid_users, 0), COALESCE(a.total_subs, 0)) AS paid_vs_total,
+  COALESCE(a.total_subs, 0) AS `Ücretli Aktif Abone`,
 
-  ROUND(SAFE_DIVIDE(COALESCE(g.trial_users, 0), COALESCE(a.total_subs, 0)) * 100, 2) AS trial_penetration_pct,
-  ROUND(SAFE_DIVIDE(COALESCE(g.paid_users, 0), COALESCE(g.trial_users, 0)) * 100, 2) AS trial_to_paid_conversion_pct,
-  ROUND(SAFE_DIVIDE(COALESCE(g.paid_users, 0), COALESCE(a.total_subs, 0)) * 100, 2) AS paid_vs_total_pct
+  COALESCE(g.trial_users, 0) AS `Trial Aboneler`,
+
+  COALESCE(g.paid_users, 0) AS `Trial'dan Ücretliye Geçmiş Kullanıcılar`,
+
+  ROUND(SAFE_DIVIDE(COALESCE(g.trial_users, 0), COALESCE(a.total_subs, 0)) * 100, 2)
+    AS `Toplam Aboneye Kıyasla Trial Aboneler`,
+
+  ROUND(SAFE_DIVIDE(COALESCE(g.paid_users, 0), COALESCE(g.trial_users, 0)) * 100, 2)
+    AS `Trial'ların Paid'e Geçiş Yüzdesi`,
+
+  ROUND(SAFE_DIVIDE(COALESCE(g.paid_users, 0), COALESCE(a.total_subs, 0)) * 100, 2)
+    AS `Tüm Abonelere Kıyasla Trial'dan Paid'e Geçiş Yüzdesi`
 
 FROM months m
 LEFT JOIN monthly_active a
   ON m.ay = a.ay
 LEFT JOIN agg g
   ON m.ay = g.ay
-ORDER BY m.ay;
+ORDER BY Tarih;
