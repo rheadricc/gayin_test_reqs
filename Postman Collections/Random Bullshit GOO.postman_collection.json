@@ -1,0 +1,39 @@
+{
+  "info": {
+    "_postman_id": "4b6435e8-3d5b-4529-8143-e77041f5812e",
+    "name": "Random Bullshit GOO",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "51163003",
+    "_collection_link": "https://go.postman.co/collection/51163003-4b6435e8-3d5b-4529-8143-e77041f5812e?source=collection_link"
+  },
+  "item": [
+    {
+      "name": "TCMB Kur Today",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "https://www.tcmb.gov.tr/kurlar/today.xml",
+          "protocol": "https",
+          "host": [
+            "www",
+            "tcmb",
+            "gov",
+            "tr"
+          ],
+          "path": [
+            "kurlar",
+            "today.xml"
+          ]
+        }
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "signinToken",
+      "value": ""
+    }
+  ]
+}
