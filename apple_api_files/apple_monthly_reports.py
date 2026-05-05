@@ -30,7 +30,7 @@ OUTPUT_DIR = "/Users/batuhancakir/GAIN_API_QUERY/apple_api_files/applereports"
 
 # Date range
 START_YEAR = 2026
-START_MONTH = 4
+START_MONTH = 3
 # End: current month (exclusive — reports have 1-day delay)
 
 
