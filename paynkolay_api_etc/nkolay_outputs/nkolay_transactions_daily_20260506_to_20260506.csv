@@ -1,0 +1,2 @@
+﻿source,raw_json
+nkolay,"{""id"": """", ""result"": {""RESPONSE_CODE"": ""0"", ""CORE_TRX_ID_RESERVED"": ""4ADB9DBA-FFEC-4018-9108-8C729F36FE4B"", ""RESPONSE_DATA"": ""Listelenecek kayıt bulunamadı."", ""sessionId"": ""46cf68f5-86ef-4290-adbc-69a9cdc78ae3"", ""ERROR_MESSAGE"": ""Listelenecek kayıt bulunamadı."", ""ERROR_CODE"": ""CORE0305""}}"

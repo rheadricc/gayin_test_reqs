@@ -14,16 +14,20 @@ load_dotenv()
 
 PAYGURU_BASE_URL = os.getenv("PAYGURU_BASE_URL", "http://api.trend-tech.net").rstrip("/")
 PAYGURU_MERCHANT_ID = os.getenv("PAYGURU_MERCHANT_ID", "").strip()
-PAYGURU_SERVICE_ID = os.getenv("PAYGURU_SERVICE_ID", "").strip()
+PAYGURU_SERVICE_IDS = [
+    s.strip()
+    for s in os.getenv("PAYGURU_SERVICE_IDS", "").split(",")
+    if s.strip()
+]
 
 OUT_DIR = Path(os.getenv("OUT_DIR", "./payguru_outputs"))
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-if not PAYGURU_MERCHANT_ID or not PAYGURU_SERVICE_ID:
+if not PAYGURU_MERCHANT_ID or not PAYGURU_SERVICE_IDS:
     raise RuntimeError(
-        "Eksik env var: PAYGURU_MERCHANT_ID / PAYGURU_SERVICE_ID"
+        "Eksik env var: PAYGURU_MERCHANT_ID / PAYGURU_SERVICE_IDS"
     )
 
 
@@ -51,12 +55,18 @@ def resolve_dates(mode: str, start_arg: Optional[str], end_arg: Optional[str]):
     raise ValueError("mode daily/manual/monthly/custom olmalı")
 
 
-def search_transactions(start_date: date, end_date: date, page: int = 1, limit: int = 100) -> Dict[str, Any]:
+def search_transactions(
+    start_date: date,
+    end_date: date,
+    service_id: str,
+    page: int = 1,
+    limit: int = 100
+) -> Dict[str, Any]:
     url = f"{PAYGURU_BASE_URL}/MicroPayment/transactions/search"
 
     body = {
         "merchantId": int(PAYGURU_MERCHANT_ID),
-        "serviceId": int(PAYGURU_SERVICE_ID),
+        "serviceId": int(service_id),
         "search": [
             {
                 "column": "modifiedDate",
@@ -113,7 +123,6 @@ def search_transactions(start_date: date, end_date: date, page: int = 1, limit: 
 
     return payload
 
-
 def extract_transactions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     for key in ["transactions", "transactionList", "data", "items", "results"]:
         value = payload.get(key)
@@ -133,7 +142,7 @@ def extract_transactions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 def normalize_transaction(t: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "transaction_id": str(t.get("id") or t.get("transactionId") or ""),
-        "service_id": str(t.get("service") or t.get("serviceId") or PAYGURU_SERVICE_ID),
+        "service_id": str(t.get("service") or t.get("serviceId") or PAYGURU_SERVICE_IDS),
         "merchant_id": str(t.get("merchant") or t.get("merchantId") or PAYGURU_MERCHANT_ID),
 
         "transaction_date": t.get("transactionDate") or t.get("createDate") or t.get("createdDate"),
@@ -156,26 +165,38 @@ def normalize_transaction(t: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def fetch_transactions(start_date: date, end_date: date) -> pd.DataFrame:
-    rows = []
-    page = 1
-    limit = 100
+def fetch_transactions(start_date, end_date):
+    all_rows = []
 
-    while True:
-        payload = search_transactions(start_date, end_date, page=page, limit=limit)
-        txs = extract_transactions(payload)
+    for service_id in PAYGURU_SERVICE_IDS:
+        print(f"[INFO] service_id={service_id} çekiliyor...")
 
-        print(f"[INFO] page={page} tx_count={len(txs)}")
+        page = 1
+        limit = 100
 
-        for tx in txs:
-            rows.append(normalize_transaction(tx))
+        while True:
+            payload = search_transactions(
+                start_date=start_date,
+                end_date=end_date,
+                service_id=service_id,
+                page=page,
+                limit=limit,
+            )
 
-        if len(txs) < limit:
-            break
+            txs = extract_transactions(payload)
+            print(f"[INFO] service_id={service_id} page={page} tx_count={len(txs)}")
 
-        page += 1
+            for tx in txs:
+                row = normalize_transaction(tx)
+                row["service_id"] = service_id
+                all_rows.append(row)
 
-    return pd.DataFrame(rows)
+            if len(txs) < limit:
+                break
+
+            page += 1
+
+    return pd.DataFrame(all_rows)
 
 
 def main():
