@@ -10,21 +10,34 @@ from tqdm import tqdm
 from google.cloud import bigquery
 from datetime import datetime, timezone, timedelta
 import uuid
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger("kids_async_identifier")
 
 USER_STATE_TABLE = "microgain-9f959.bc_t.user_kids_profile_state"
+USER_STATE_STAGING_TABLE = "microgain-9f959.bc_t.user_kids_profile_state_staging"
+BQ_TABLE = "microgain-9f959.bc_t.active_subscribers_snapshot"
 
 def write_user_states_to_bq(user_states: list[dict]):
     if not user_states:
-        print("[BQ] No user states to write.")
+        logger.info("[BQ] No user states to write.")
         return
 
     client = bigquery.Client()
 
-    rows = []
     run_id = str(uuid.uuid4())
     checked_at = datetime.now(timezone.utc).isoformat()
 
+    rows = []
     for row in user_states:
+        if not row.get("user_id"):
+            continue
+
         rows.append({
             "user_id": row["user_id"],
             "subscription_status": row["subscription_status"],
@@ -37,29 +50,104 @@ def write_user_states_to_bq(user_states: list[dict]):
             "run_id": run_id,
         })
 
-    errors = client.insert_rows_json(USER_STATE_TABLE, rows)
+    if not rows:
+        logger.info("[BQ] No valid user states to write.")
+        return
 
-    if errors:
-        raise RuntimeError(f"BQ user state insert error: {errors}")
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        schema=[
+            bigquery.SchemaField("user_id", "STRING"),
+            bigquery.SchemaField("subscription_status", "STRING"),
+            bigquery.SchemaField("has_kid_profile", "BOOL"),
+            bigquery.SchemaField("total_profiles", "INT64"),
+            bigquery.SchemaField("kid_profile_count", "INT64"),
+            bigquery.SchemaField("user_created_at", "TIMESTAMP"),
+            bigquery.SchemaField("user_updated_at", "TIMESTAMP"),
+            bigquery.SchemaField("checked_at", "TIMESTAMP"),
+            bigquery.SchemaField("run_id", "STRING"),
+        ],
+    )
 
-    print(f"[BQ USER STATE INSERT] {len(rows)} rows")
-    
-BQ_TABLE = "microgain-9f959.bc_t.active_subscribers_snapshot"
+    load_job = client.load_table_from_json(
+        rows,
+        USER_STATE_STAGING_TABLE,
+        job_config=job_config
+    )
+    load_job.result()
 
-def write_snapshot_to_bq(active_total: int, kids_total: int, source: str = "backoffice_api"):
+    logger.info("[BQ STAGING LOAD] %s rows", len(rows))
+
+    merge_sql = f"""
+    MERGE `{USER_STATE_TABLE}` T
+    USING `{USER_STATE_STAGING_TABLE}` S
+    ON T.user_id = S.user_id
+
+    WHEN MATCHED THEN UPDATE SET
+      subscription_status = S.subscription_status,
+      has_kid_profile = S.has_kid_profile,
+      total_profiles = S.total_profiles,
+      kid_profile_count = S.kid_profile_count,
+      user_created_at = S.user_created_at,
+      user_updated_at = S.user_updated_at,
+      checked_at = S.checked_at,
+      run_id = S.run_id
+
+    WHEN NOT MATCHED THEN INSERT (
+      user_id,
+      subscription_status,
+      has_kid_profile,
+      total_profiles,
+      kid_profile_count,
+      user_created_at,
+      user_updated_at,
+      checked_at,
+      run_id
+    )
+    VALUES (
+      S.user_id,
+      S.subscription_status,
+      S.has_kid_profile,
+      S.total_profiles,
+      S.kid_profile_count,
+      S.user_created_at,
+      S.user_updated_at,
+      S.checked_at,
+      S.run_id
+    )
+    """
+
+    merge_job = client.query(merge_sql)
+    merge_job.result()
+
+    logger.info("[BQ USER STATE MERGE] %s rows merged", len(rows))
+
+def write_snapshot_to_bq(source: str = "backoffice_api"):
     client = bigquery.Client()
+
+    summary_sql = f"""
+    SELECT
+      COUNT(*) AS active_total,
+      COUNTIF(has_kid_profile) AS kids_total
+    FROM `{USER_STATE_TABLE}`
+    WHERE subscription_status IN ('ACTIVE', 'IN_GRACE', 'ON_HOLD')
+    """
+
+    result = list(client.query(summary_sql).result())[0]
+
     row = {
         "snapshot_ts": datetime.now(timezone.utc).isoformat(),
-        "active_total": int(active_total) if active_total is not None else None,
-        "kids_total": int(kids_total),
+        "active_total": int(result.active_total),
+        "kids_total": int(result.kids_total),
         "source": source,
         "run_id": str(uuid.uuid4()),
     }
+
     errors = client.insert_rows_json(BQ_TABLE, [row])
     if errors:
         raise RuntimeError(f"BigQuery insert error: {errors}")
-    print("[BQ] Insert OK:", row)
-    
+
+    logger.info("[BQ SNAPSHOT INSERT] %s", row)
 
 RESULT_FILE = "last_run_result.json"
 
@@ -70,17 +158,28 @@ def clear_run_state():
         except FileNotFoundError:
             pass
         
-def save_final_result(active_total, scanned_total, kids_total):
+def save_final_result(active_total, scanned_total, kids_total, state_rows, run_started_at, run_finished_at):
+    duration_seconds = (run_finished_at - run_started_at).total_seconds()
+
     data = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_started_at": run_started_at.isoformat(),
+        "run_finished_at": run_finished_at.isoformat(),
+        "duration_seconds": duration_seconds,
+        "duration_minutes": round(duration_seconds / 60, 2),
         "active_total": active_total,
         "scanned_total": scanned_total,
         "kids_total": kids_total,
+        "state_rows": state_rows,
+        "scan_mode": SCAN_MODE,
+        "max_pages": MAX_PAGES,
+        "page_size": PAGE_SIZE,
+        "max_workers": CONCURRENT_REQUESTS,
     }
+
     with open(RESULT_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-    print("[RESULT FILE WRITTEN]", RESULT_FILE)
+    logger.info("[RESULT FILE WRITTEN] %s", RESULT_FILE)
 
 
 load_dotenv()
@@ -92,8 +191,8 @@ LIST_MAX_RETRIES = 4           # list için 4 deneme
 LIST_BASE_BACKOFF = 1.5        # 1.5s, 3s, 6s, 10s (cap ile)
 LIST_BACKOFF_CAP = 10.0        # max 10s
 LIST_FAIL_COOLDOWN = 10.0      # list fail olunca sayfa geçmeden önce 10s dinlen
-FAILED_RETRY_ROUNDS = 2        # en sonda failed'ları kaç tur döneceğiz
-FAILED_ROUND_COOLDOWN = 30.0   # failed turu arası bekleme
+FAILED_RETRY_ROUNDS = 5        # en sonda failed'ları kaç tur döneceğiz
+FAILED_ROUND_COOLDOWN = 60.0   # failed turu arası bekleme
 
 BASE_URL = os.getenv("PROD_BASE_URL", "").rstrip("/")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
@@ -105,6 +204,8 @@ CONCURRENT_REQUESTS = int(os.getenv("MAX_WORKERS", "100"))
 
 PAUSE_EVERY_PAGES = int(os.getenv("PAUSE_EVERY_PAGES", "50"))
 PAUSE_SECONDS = float(os.getenv("PAUSE_SECONDS", "10"))
+ENABLE_TQDM = os.getenv("ENABLE_TQDM", "0") == "1"
+
 
 LIST_URL = f"{BASE_URL}/CALL/User/getUserList/default"
 DETAIL_URL_TMPL = f"{BASE_URL}/CALL/User/getUserDetailForBo/{{user_id}}"
@@ -139,7 +240,7 @@ def build_query():
     return base_query
 
 QUERY_ACTIVE = build_query()
-print(f"[QUERY] {QUERY_ACTIVE}")
+logger.info("[QUERY] %s", QUERY_ACTIVE)
 
 def load_checkpoint():
     try:
@@ -190,7 +291,12 @@ async def fetch_list_page(session, offset: int):
 
                 if resp.status in (429, 500, 502, 503, 504):
                     sleep_s = min(LIST_BACKOFF_CAP, LIST_BASE_BACKOFF * (2 ** attempt))
-                    print(f"[LIST RETRY] offset={offset} status={resp.status} sleep={sleep_s:.1f}s")
+                    logger.warning(
+                        "[LIST RETRY] offset=%s status=%s sleep=%.1fs",
+                        offset,
+                        resp.status,
+                        sleep_s
+                    )
                     await asyncio.sleep(sleep_s)
                     continue
 
@@ -226,10 +332,15 @@ async def fetch_list_page(session, offset: int):
         except Exception as e:
             # network / timeout vb.
             sleep_s = min(LIST_BACKOFF_CAP, LIST_BASE_BACKOFF * (2 ** attempt))
-            print(f"[LIST RETRY] offset={offset} err={type(e).__name__} sleep={sleep_s:.1f}s")
+            logger.warning(
+                    "[LIST RETRY] offset=%s err=%s sleep=%.1fs",
+                    offset,
+                    type(e).__name__,
+                    sleep_s
+                )
             await asyncio.sleep(sleep_s)
 
-    print(f"[LIST FAIL] offset={offset} status={last_status}")
+    logger.error("[LIST FAIL] offset=%s status=%s", offset, last_status)
     return None, None
 
 async def fetch_user_state(session, user_id: str):
@@ -259,9 +370,8 @@ async def fetch_user_state(session, user_id: str):
         }
 
     except Exception as e:
-        print(f"[DETAIL FAIL] {user_id}: {type(e).__name__}")
+        logger.exception(f"[DETAIL FAIL] {user_id}: {type(e).__name__}")
         return None
-
 
 async def process_ids(session, ids: List[str]) -> Tuple[int, int, List[dict]]:
     kids = 0
@@ -279,21 +389,25 @@ async def process_ids(session, ids: List[str]) -> Tuple[int, int, List[dict]]:
 
     tasks = [bounded(uid) for uid in ids]
 
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), leave=False):
+    iterator = asyncio.as_completed(tasks)
+
+    if ENABLE_TQDM:
+        iterator = tqdm(iterator, total=len(tasks), leave=False)
+
+    for coro in iterator:
         result = await coro
         scanned += 1
-        
+
         if result:
             user_states.append(result)
-            
-            if result and result["has_kid_profile"]:
+
+            if result["has_kid_profile"]:
                 kids += 1
 
     return scanned, kids, user_states
 
-
 async def main():
-
+    run_started_at = datetime.now(timezone.utc)
     timeout = aiohttp.ClientTimeout(total=15)
 
     connector = aiohttp.TCPConnector(
@@ -317,7 +431,13 @@ async def main():
             start_page = int(checkpoint.get("last_page", 0)) + 1
             scanned_total = int(checkpoint.get("scanned_users", 0))
             kids_total = int(checkpoint.get("kids_users", 0))
-            print(f"[RESUME] page={start_page} (last={checkpoint.get('last_page')}) scanned={scanned_total} kids={kids_total}")
+            logger.info(
+                    "[RESUME] page=%s last=%s scanned=%s kids=%s",
+                    start_page,
+                    checkpoint.get("last_page"),
+                    scanned_total,
+                    kids_total
+                )
 
 
         first_ids, meta = await fetch_list_page(session, 0)
@@ -326,6 +446,9 @@ async def main():
             raise RuntimeError("List endpoint fail: meta alınamadı. Script durduruldu.")
 
         active_total = meta.get("total")
+
+        if first_ids is None and active_total:
+            logger.warning("[FIRST PAGE EMPTY] active_total=%s", active_total)
 
 
         total_pages = meta.get("totalPage", 1)
@@ -339,11 +462,9 @@ async def main():
             s, k, states = await process_ids(session, first_ids)
             all_states.extend(states)
             
-            print(states[:3])
-            
             scanned_total += s
             kids_total += k
-            print(f"[progress] page=1 scanned={scanned_total} kids={kids_total}")
+            logger.info("[PROGRESS] page=1 scanned=%s kids=%s", scanned_total, kids_total)
             save_checkpoint(1, scanned_total, kids_total)
             start_page = 2
 
@@ -358,38 +479,46 @@ async def main():
                 if not ids:
                     failed_pages.append(page)
                     save_failed_pages(failed_pages)
-                    print(f"[SKIP] page={page} offset={offset} (empty/failed) cooldown=10s")
-                    await asyncio.sleep(10)
+                    logger.warning(
+                            "[SKIP] page=%s offset=%s empty_or_failed cooldown=%.1fs",
+                            page,
+                            offset,
+                            LIST_FAIL_COOLDOWN
+                        )
+                    await asyncio.sleep(LIST_FAIL_COOLDOWN)
                     continue
 
                 s, k, states = await process_ids(session, ids)
                 all_states.extend(states)
                 
-                print(states[:3])
-                
                 scanned_total += s
                 kids_total += k
 
-                print(f"[progress] page={page} scanned={scanned_total} kids={kids_total}")
+                logger.info("[PROGRESS] page=%s scanned=%s kids=%s", page, scanned_total, kids_total)
                 save_checkpoint(page, scanned_total, kids_total)
 
                 if PAUSE_EVERY_PAGES and page % PAUSE_EVERY_PAGES == 0:
-                    print(f"\n[PAUSE] {PAUSE_SECONDS} saniye...\n")
+                    logger.info("[PAUSE] %.1f seconds", PAUSE_SECONDS)
                     await asyncio.sleep(PAUSE_SECONDS)
 
         else:
-            print("[SCAN ALREADY COMPLETE — SKIPPING MAIN SCAN]")
+            logger.info("[SCAN ALREADY COMPLETE] skipping main scan")
     
         failed_pages = load_failed_pages()
         if failed_pages:
-            print(f"\n[FAILED QUEUE] {len(failed_pages)} page tekrar denenecek.")
+            logger.warning("[FAILED QUEUE] %s pages will be retried", len(failed_pages))
 
         for round_no in range(1, FAILED_RETRY_ROUNDS + 1):
             failed_pages = load_failed_pages()
             if not failed_pages:
                 break
 
-            print(f"\n[FAILED ROUND {round_no}/{FAILED_RETRY_ROUNDS}] pages={len(failed_pages)}")
+            logger.warning(
+                    "[FAILED ROUND] round=%s/%s pages=%s",
+                    round_no,
+                    FAILED_RETRY_ROUNDS,
+                    len(failed_pages)
+                )
             still_failed = []
 
             for page in failed_pages:
@@ -403,36 +532,52 @@ async def main():
                 s, k, states = await process_ids(session, ids)
                 all_states.extend(states)
                 
-                print(states[:3])
-                
                 scanned_total += s
                 kids_total += k
 
-                print(f"[recovered] page={page} scanned={scanned_total} kids={kids_total}")
+                logger.info("[RECOVERED] page=%s scanned=%s kids=%s", page, scanned_total, kids_total)
                 save_checkpoint(page, scanned_total, kids_total)
 
             save_failed_pages(still_failed)
 
             if still_failed:
-                print(f"[FAILED ROUND {round_no}] kalan={len(still_failed)} cooldown={FAILED_ROUND_COOLDOWN:.0f}s")
+                logger.warning(
+                        "[FAILED ROUND REMAINING] round=%s remaining=%s cooldown=%.0fs",
+                        round_no,
+                        len(still_failed),
+                        FAILED_ROUND_COOLDOWN
+                    )
                 await asyncio.sleep(FAILED_ROUND_COOLDOWN)
                 
         # en son rapor
+    run_finished_at = datetime.now(timezone.utc)
+    duration_seconds = (run_finished_at - run_started_at).total_seconds()
 
-    print("\n==== RESULT ====")
-    print(f"Active subscribers: {active_total}")
-    print(f"Scanned users: {scanned_total}")
-    print(f"Users with KID profile: {kids_total}")
-    print(all_states[:3])
-    print(len(all_states))
-    
-    save_final_result(active_total, scanned_total, kids_total)
+    logger.info(
+        "[RESULT] started=%s finished=%s duration_min=%.2f active_total=%s scanned_total=%s kids_total=%s state_rows=%s",
+        run_started_at.isoformat(),
+        run_finished_at.isoformat(),
+        duration_seconds / 60,
+        active_total,
+        scanned_total,
+        kids_total,
+        len(all_states)
+    )
+
+    save_final_result(
+        active_total,
+        scanned_total,
+        kids_total,
+        len(all_states),
+        run_started_at,
+        run_finished_at
+    )
     write_user_states_to_bq(all_states)
-    write_snapshot_to_bq(active_total, kids_total)
+    write_snapshot_to_bq()
 
     clear_run_state()
 
-    print("\nRUN STATE RESET — READY FOR NEXT EXECUTION")
+    logger.info("[RUN STATE RESET] ready for next execution")
 
 
 if __name__ == "__main__":
