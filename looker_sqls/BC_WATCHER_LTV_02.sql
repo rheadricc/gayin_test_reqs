@@ -1,5 +1,6 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
 -- Output: Heavy vs Light watcher LTV (TRY-only, paying users only)
+-- REVIEW NOTE: This uses active-day prorated LTV and is closer to monthly realized LTV logic.
 -- Logic:
 --   - cohort window shifted back by 90 days
 --   - first meaningful watch defines cohort entry

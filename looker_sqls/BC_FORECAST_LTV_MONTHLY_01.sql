@@ -2,6 +2,7 @@
 -- New name: BC_FORECAST_LTV_MONTHLY_01
 -- Output: MONTH grain only
 -- Metric: Forecast LTV = ARPU × avg lifetime months
+-- REVIEW NOTE: Forecast metric is intentionally different from realized LTV; do not compare as the same metric.
 -- Logic:
 --   - TRY-only
 --   - PREPAID excluded

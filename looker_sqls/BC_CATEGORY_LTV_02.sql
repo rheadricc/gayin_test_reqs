@@ -1,5 +1,7 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
 -- Output: category-level average realized LTV
+-- REVIEW NOTE: This query uses raw payment-sum realized LTV, while monthly realized LTV uses prorated active-day revenue.
+-- Keep only if the intended metric is lifetime payment-sum by first watched category; otherwise align to active-day LTV.
 -- Logic:
 --   - first category = user's first meaningful watched content's first genre
 --   - LTV = TRY-only realized LTV (real payment sum net of commission/tax)

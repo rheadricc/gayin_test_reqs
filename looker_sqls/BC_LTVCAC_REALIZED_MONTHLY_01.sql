@@ -1,9 +1,9 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
 -- Name: BC_LTVCAC_REALIZED_MONTHLY_01
 -- Output: MONTH grain only
--- Logic:
+-- Standardized:
 --   - Realized LTV uses cumulative realized net revenue
---   - CAC uses TRY-only attributed new paid users
+--   - CAC uses ads_daily_spend + last eligible paid touch in 30 days before first payment
 --   - Includes ARPU so CAC Payback Period = CAC / ARPU can be shown from same dataset
 
 WITH params AS (
@@ -13,18 +13,35 @@ WITH params AS (
 ),
 
 /* =========================
-   CAC PART
+   CAC PART - STANDARDIZED
    ========================= */
+
+spend_raw AS (
+  SELECT
+    month,
+    LOWER(TRIM(CAST(channel AS STRING))) AS raw_channel,
+    spend_tl
+  FROM `microgain-9f959.bc_marketing_marts.ads_daily_spend`
+  CROSS JOIN params p
+  WHERE month BETWEEN DATE_TRUNC(p.ds_start, MONTH)
+                  AND DATE_TRUNC(p.ds_end, MONTH)
+),
 
 spend AS (
   SELECT
     month,
-    LOWER(channel) AS channel,
+    CASE
+      WHEN REGEXP_CONTAINS(raw_channel, r'google|adwords|gads|youtube') THEN 'google'
+      WHEN REGEXP_CONTAINS(raw_channel, r'meta|facebook|instagram|fb|ig|paid_social|social') THEN 'meta'
+      WHEN REGEXP_CONTAINS(raw_channel, r'tiktok|tik_tok') THEN 'tiktok'
+      ELSE raw_channel
+    END AS channel,
     SUM(spend_tl) AS spend_tl
-  FROM `microgain-9f959.bc_marketing_raw.manual_monthly_spend`
-  CROSS JOIN params p
-  WHERE LOWER(channel) IN ('google', 'meta', 'tiktok')
-    AND month BETWEEN DATE_TRUNC(p.ds_start, MONTH) AND DATE_TRUNC(p.ds_end, MONTH)
+  FROM spend_raw
+  WHERE REGEXP_CONTAINS(
+    raw_channel,
+    r'google|adwords|gads|youtube|meta|facebook|instagram|fb|ig|paid_social|social|tiktok|tik_tok'
+  )
   GROUP BY month, channel
 ),
 
@@ -37,28 +54,67 @@ cac_date_bounds AS (
 
 first_paid AS (
   SELECT
-    user_id,
+    CAST(user_id AS STRING) AS user_id,
     MIN(DATE(created_at)) AS first_paid_date
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment`
   WHERE user_id IS NOT NULL
     AND payment_option IS NOT NULL
-    AND payment_option != 'PREPAID'
-    AND amount > 0
-    AND UPPER(currency) = 'TRY'
+    AND UPPER(TRIM(payment_option)) != 'PREPAID'
+    AND COALESCE(amount, amount_before_promotions, 0) > 0
+    AND UPPER(TRIM(currency)) = 'TRY'
   GROUP BY user_id
+),
+
+normalized_touches AS (
+  SELECT
+    CAST(g.user_id AS STRING) AS user_id,
+    g.touch_date,
+    LOWER(TRIM(CAST(g.source AS STRING))) AS source,
+    LOWER(TRIM(CAST(g.medium AS STRING))) AS medium,
+    LOWER(TRIM(COALESCE(CAST(g.campaign AS STRING), 'null'))) AS campaign,
+    LOWER(TRIM(CAST(g.mapped_channel AS STRING))) AS mapped_channel,
+    CASE
+      WHEN REGEXP_CONTAINS(LOWER(TRIM(CONCAT(COALESCE(CAST(g.mapped_channel AS STRING), ''), ' ', COALESCE(CAST(g.source AS STRING), ''), ' ', COALESCE(CAST(g.medium AS STRING), ''), ' ', COALESCE(CAST(g.campaign AS STRING), '')))), r'google|adwords|gads|youtube') THEN 'google'
+      WHEN REGEXP_CONTAINS(LOWER(TRIM(CONCAT(COALESCE(CAST(g.mapped_channel AS STRING), ''), ' ', COALESCE(CAST(g.source AS STRING), ''), ' ', COALESCE(CAST(g.medium AS STRING), ''), ' ', COALESCE(CAST(g.campaign AS STRING), '')))), r'meta|facebook|instagram|fb|ig|l\.instagram|m\.facebook|l\.facebook') THEN 'meta'
+      WHEN REGEXP_CONTAINS(LOWER(TRIM(CONCAT(COALESCE(CAST(g.mapped_channel AS STRING), ''), ' ', COALESCE(CAST(g.source AS STRING), ''), ' ', COALESCE(CAST(g.medium AS STRING), ''), ' ', COALESCE(CAST(g.campaign AS STRING), '')))), r'tiktok|tik_tok') THEN 'tiktok'
+      ELSE NULL
+    END AS channel
+  FROM `microgain-9f959.bc_marketing_raw.ga4_first_non_direct_touch` g
+  CROSS JOIN cac_date_bounds b
+  WHERE g.touch_date BETWEEN DATE_SUB(b.min_month, INTERVAL 30 DAY)
+                         AND LAST_DAY(b.max_month)
+),
+
+last_touch_before_paid AS (
+  SELECT
+    fp.user_id,
+    fp.first_paid_date,
+    DATE_TRUNC(fp.first_paid_date, MONTH) AS month,
+    t.channel,
+    t.touch_date,
+    t.medium
+  FROM first_paid fp
+  JOIN normalized_touches t
+    ON fp.user_id = t.user_id
+  CROSS JOIN cac_date_bounds b
+  WHERE fp.first_paid_date BETWEEN b.min_month AND LAST_DAY(b.max_month)
+    AND t.channel IN ('google', 'meta', 'tiktok')
+    AND DATE_DIFF(fp.first_paid_date, t.touch_date, DAY) BETWEEN 0 AND 30
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY fp.user_id
+    ORDER BY
+      t.touch_date DESC,
+      CASE WHEN t.medium IN ('cpc', 'cpa', 'paid', 'paid_social', 'search_cpc') THEN 1 ELSE 0 END DESC,
+      t.channel
+  ) = 1
 ),
 
 attributed_paid_users AS (
   SELECT
-    DATE_TRUNC(fp.first_paid_date, MONTH) AS month,
-    g.mapped_channel AS channel,
-    COUNT(DISTINCT fp.user_id) AS new_paid_users
-  FROM first_paid fp
-  JOIN `microgain-9f959.bc_marketing_raw.ga4_first_non_direct_touch` g
-    ON fp.user_id = g.user_id
-  CROSS JOIN cac_date_bounds b
-  WHERE fp.first_paid_date BETWEEN b.min_month AND LAST_DAY(b.max_month)
-    AND DATE_DIFF(fp.first_paid_date, g.touch_date, DAY) BETWEEN 0 AND 30
+    month,
+    channel,
+    COUNT(DISTINCT user_id) AS new_paid_users
+  FROM last_touch_before_paid
   GROUP BY month, channel
 ),
 
@@ -67,7 +123,13 @@ monthly_blended_cac AS (
     s.month,
     SUM(s.spend_tl) AS spend_tl,
     SUM(COALESCE(a.new_paid_users, 0)) AS new_paid_users,
-    SAFE_DIVIDE(SUM(s.spend_tl), SUM(COALESCE(a.new_paid_users, 0))) AS cac_tl
+    SAFE_DIVIDE(SUM(s.spend_tl), SUM(COALESCE(a.new_paid_users, 0))) AS cac_tl,
+    CASE
+      WHEN SUM(s.spend_tl) > 0 AND SUM(COALESCE(a.new_paid_users, 0)) > 0 THEN 'ok'
+      WHEN SUM(s.spend_tl) > 0 AND SUM(COALESCE(a.new_paid_users, 0)) = 0 THEN 'spend_var_user_yok'
+      WHEN SUM(s.spend_tl) = 0 AND SUM(COALESCE(a.new_paid_users, 0)) > 0 THEN 'spend_yok_user_var'
+      ELSE 'spend_yok_user_yok'
+    END AS cac_status
   FROM spend s
   LEFT JOIN attributed_paid_users a
     ON s.month = a.month
@@ -269,6 +331,7 @@ final AS (
     c.spend_tl,
     c.new_paid_users,
     c.cac_tl,
+    c.cac_status,
     l.realized_ltv_tl,
     SAFE_DIVIDE(l.realized_ltv_tl, c.cac_tl) AS ltv_cac_ratio,
     SAFE_DIVIDE(c.cac_tl, l.arpu_tl) AS cac_payback_period,
@@ -291,6 +354,7 @@ SELECT
   spend_tl,
   new_paid_users,
   cac_tl,
+  cac_status,
   realized_ltv_tl,
   ltv_cac_ratio,
   cac_payback_period,

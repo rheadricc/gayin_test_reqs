@@ -2,6 +2,7 @@
 -- New name: BC_REALIZED_LTV_MONTHLY_01
 -- Output: MONTH grain only
 -- Metric: realized cumulative LTV up to month-end
+-- REVIEW NOTE: Core LTV basis is active-day prorated realized net revenue.
 -- Logic:
 --   - TRY-only
 --   - PREPAID excluded
