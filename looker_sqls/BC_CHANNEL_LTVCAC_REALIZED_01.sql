@@ -244,15 +244,15 @@ monthly_channel_final AS (
 
 selected_channel_user_metrics AS (
   SELECT
-    channel,
-    COUNT(DISTINCT user_id) AS users,
+    uc.channel,
+    COUNT(DISTINCT uc.user_id) AS users,
     AVG(COALESCE(l.user_realized_ltv_tl, 0)) AS avg_realized_ltv_tl,
     APPROX_QUANTILES(COALESCE(l.user_realized_ltv_tl, 0), 100)[OFFSET(50)] AS median_realized_ltv_tl,
     SUM(COALESCE(l.user_realized_ltv_tl, 0)) AS total_realized_ltv_tl
   FROM user_channel_full uc
   LEFT JOIN user_realized_ltv l
     ON uc.user_id = l.user_id
-  GROUP BY channel
+  GROUP BY uc.channel
 ),
 
 selected_spend AS (
