@@ -1,0 +1,6 @@
+apache-airflow-providers-slack
+pandas
+apache-airflow-providers-google
+google-cloud-storage
+apache-airflow-providers-amazon
+elasticsearch<9.0.0

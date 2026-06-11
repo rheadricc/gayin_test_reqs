@@ -1,7 +1,7 @@
 import os
 import asyncio
 import json
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from dotenv import load_dotenv
@@ -11,6 +11,9 @@ from google.cloud import bigquery
 from datetime import datetime, timezone, timedelta
 import uuid
 import logging
+
+import boto3
+from botocore.exceptions import ClientError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +57,23 @@ def write_user_states_to_bq(user_states: list[dict]):
         logger.info("[BQ] No valid user states to write.")
         return
 
+    # BigQuery MERGE aynı user_id için source tarafta birden fazla satır gelirse patlar.
+    # BO list/detail akışında retry, resume veya liste endpoint davranışı nedeniyle aynı user_id birden fazla kez dönebilir.
+    # Bu yüzden staging'e yüklemeden önce user_id bazında tekilleştiriyoruz.
+    deduped_rows = {}
+    for row in rows:
+        deduped_rows[row["user_id"]] = row
+
+    if len(deduped_rows) != len(rows):
+        logger.warning(
+            "[BQ DEDUPE] rows=%s unique_user_rows=%s duplicate_rows=%s",
+            len(rows),
+            len(deduped_rows),
+            len(rows) - len(deduped_rows),
+        )
+
+    rows = list(deduped_rows.values())
+
     job_config = bigquery.LoadJobConfig(
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         schema=[
@@ -80,7 +100,17 @@ def write_user_states_to_bq(user_states: list[dict]):
 
     merge_sql = f"""
     MERGE `{USER_STATE_TABLE}` T
-    USING `{USER_STATE_STAGING_TABLE}` S
+    USING (
+      SELECT * EXCEPT(rn)
+      FROM (
+        SELECT
+          S.*,
+          ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY checked_at DESC) AS rn
+        FROM `{USER_STATE_STAGING_TABLE}` S
+        WHERE user_id IS NOT NULL
+      )
+      WHERE rn = 1
+    ) S
     ON T.user_id = S.user_id
 
     WHEN MATCHED THEN UPDATE SET
@@ -194,8 +224,22 @@ LIST_FAIL_COOLDOWN = 10.0      # list fail olunca sayfa geçmeden önce 10s dinl
 FAILED_RETRY_ROUNDS = 5        # en sonda failed'ları kaç tur döneceğiz
 FAILED_ROUND_COOLDOWN = 60.0   # failed turu arası bekleme
 
-BASE_URL = os.getenv("PROD_BASE_URL", "").rstrip("/")
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+BASE_URL = os.getenv("PROD_BASE_URL", "https://api.gain.tv/2da7kf8jf").rstrip("/")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+
+# Prod MWAA: S3 token store kullanır.
+# Lokal test: TOKEN_STORE_MODE=local verilirse aynı JSON formatını lokal dosyadan okur/yazar.
+TOKEN_STORE_MODE = os.getenv("TOKEN_STORE_MODE", "s3").strip().lower()
+
+S3_BUCKET = os.getenv("S3_BUCKET", "gain-data-airflow-bucket").strip()
+S3_TOKEN_KEY = os.getenv("S3_TOKEN_KEY", "airflow_keys/token_store.json").strip()
+
+LOCAL_TOKEN_STORE_PATH = os.getenv("LOCAL_TOKEN_STORE_PATH", "token_store.json").strip()
+
+REFRESH_URL = os.getenv(
+    "REFRESH_URL",
+    "https://api.gain.tv/2da7kf8jf/TOKEN/refresh?__culture=tr-tr"
+).strip()
 
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
 MAX_PAGES = int(os.getenv("MAX_PAGES", "0"))
@@ -210,10 +254,187 @@ ENABLE_TQDM = os.getenv("ENABLE_TQDM", "0") == "1"
 LIST_URL = f"{BASE_URL}/CALL/User/getUserList/default"
 DETAIL_URL_TMPL = f"{BASE_URL}/CALL/User/getUserDetailForBo/{{user_id}}"
 
-HEADERS = {
-    "Authorization": AUTH_TOKEN,
-    "Content-Type": "application/json",
-}
+
+def normalize_bearer_token(token: str) -> str:
+    token = (token or "").strip()
+    if not token:
+        return ""
+    return token if token.lower().startswith("bearer ") else f"Bearer {token}"
+
+
+def get_access_token_from_store_payload(tokens: Dict[str, Any]) -> str:
+    return (
+        tokens.get("accessToken")
+        or tokens.get("access_token")
+        or tokens.get("token")
+        or tokens.get("jwt")
+        or ""
+    )
+
+
+def get_refresh_token_from_store_payload(tokens: Dict[str, Any]) -> str:
+    return (
+        tokens.get("refreshToken")
+        or tokens.get("refresh_token")
+        or tokens.get("refresh")
+        or ""
+    )
+
+
+def load_tokens() -> Dict[str, Any]:
+    if TOKEN_STORE_MODE == "local":
+        try:
+            with open(LOCAL_TOKEN_STORE_PATH, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.warning("[AUTH] Lokal token store bulunamadı: %s", LOCAL_TOKEN_STORE_PATH)
+            return {
+                "accessToken": AUTH_TOKEN,
+                "refreshToken": "",
+            }
+
+    s3_client = boto3.client("s3")
+
+    try:
+        response = s3_client.get_object(
+            Bucket=S3_BUCKET,
+            Key=S3_TOKEN_KEY,
+        )
+        return json.loads(response["Body"].read().decode("utf-8"))
+
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchKey":
+            logger.warning(
+                "[AUTH] S3 token store bulunamadı: s3://%s/%s",
+                S3_BUCKET,
+                S3_TOKEN_KEY,
+            )
+            return {
+                "accessToken": AUTH_TOKEN,
+                "refreshToken": "",
+            }
+
+        raise
+
+
+def save_tokens(tokens: Dict[str, Any]) -> None:
+    payload = {
+        "accessToken": get_access_token_from_store_payload(tokens),
+        "refreshToken": get_refresh_token_from_store_payload(tokens),
+    }
+
+    if TOKEN_STORE_MODE == "local":
+        with open(LOCAL_TOKEN_STORE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+
+        logger.info("[AUTH] Lokal token store güncellendi: %s", LOCAL_TOKEN_STORE_PATH)
+        return
+
+    s3_client = boto3.client("s3")
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=S3_TOKEN_KEY,
+        Body=json.dumps(payload),
+        ContentType="application/json",
+    )
+
+    logger.info(
+        "[AUTH] S3 token store güncellendi: s3://%s/%s",
+        S3_BUCKET,
+        S3_TOKEN_KEY,
+    )
+
+
+def build_auth_headers() -> Dict[str, str]:
+    return {
+        "Authorization": normalize_bearer_token(AUTH_TOKEN),
+        "Content-Type": "application/json",
+        "User-Agent": "Python/aiohttp",
+    }
+
+
+async def refresh_access_token(session: aiohttp.ClientSession) -> Optional[str]:
+    tokens = load_tokens()
+    refresh_token = get_refresh_token_from_store_payload(tokens)
+
+    if not refresh_token:
+        logger.warning("[AUTH] Refresh token bulunamadı. Refresh adımı atlanıyor.")
+        return None
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "refreshToken": refresh_token,
+    }
+
+    async with session.post(
+        REFRESH_URL,
+        headers=headers,
+        json=body,
+        timeout=30,
+    ) as resp:
+        if resp.status != 200:
+            response_text = await resp.text()
+            logger.warning(
+                "[AUTH] Refresh token başarısız status=%s body=%s",
+                resp.status,
+                response_text[:500],
+            )
+            return None
+
+        new_tokens = await resp.json()
+
+    new_access_token = get_access_token_from_store_payload(new_tokens)
+    new_refresh_token = get_refresh_token_from_store_payload(new_tokens)
+
+    if not new_access_token:
+        logger.warning("[AUTH] Refresh response içinde access token bulunamadı.")
+        return None
+
+    save_tokens({
+        "accessToken": new_access_token,
+        "refreshToken": new_refresh_token or refresh_token,
+    })
+
+    logger.info("[AUTH] Token refresh ile yenilendi.")
+    return new_access_token
+
+async def ensure_auth_token(session: aiohttp.ClientSession, force: bool = False) -> bool:
+    global AUTH_TOKEN
+
+    # Normal akışta her request öncesi S3/local token_store okumayalım.
+    # İlk run başında AUTH_TOKEN set edilir; 401 gelirse force=True ile refresh denenir.
+    if AUTH_TOKEN and not force:
+        return True
+
+    tokens = load_tokens()
+    store_access_token = get_access_token_from_store_payload(tokens)
+    store_refresh_token = get_refresh_token_from_store_payload(tokens)
+
+    # Normal çalışma:
+    # token_store.json içindeki mevcut accessToken direkt kullanılır.
+    if store_access_token and not force:
+        AUTH_TOKEN = normalize_bearer_token(store_access_token)
+        return True
+
+    # 401 veya boş accessToken durumunda:
+    # Prod_Gain_BO_Promotion_Data_To_Bq_Script.py ile aynı mantıkta refresh denenir.
+    if store_refresh_token:
+        refreshed_token = await refresh_access_token(session)
+        if refreshed_token:
+            AUTH_TOKEN = normalize_bearer_token(refreshed_token)
+            return True
+
+    # Refresh token yoksa veya refresh başarısızsa:
+    # eldeki accessToken son kez kullanılır.
+    if store_access_token:
+        AUTH_TOKEN = normalize_bearer_token(store_access_token)
+        return True
+
+    logger.warning("[AUTH] Kullanılabilir accessToken bulunamadı. token_store.json kontrol edilmeli.")
+    return False
 
 SCAN_MODE = os.getenv("SCAN_MODE", "full").lower()
 DATE_FIELD = os.getenv("DATE_FIELD", "updatedAt")
@@ -286,8 +507,15 @@ async def fetch_list_page(session, offset: int):
     last_status = None
     for attempt in range(LIST_MAX_RETRIES):
         try:
-            async with session.post(LIST_URL, json=body, timeout=30) as resp:
+            if not await ensure_auth_token(session):
+                raise RuntimeError("Auth token alınamadı. token_store.json içeriği kontrol edilmeli.")
+
+            async with session.post(LIST_URL, json=body, timeout=30, headers=build_auth_headers()) as resp:
                 last_status = resp.status
+
+                if resp.status == 401 and await ensure_auth_token(session, force=True):
+                    logger.warning("[LIST RETRY] offset=%s status=401 token refreshed", offset)
+                    continue
 
                 if resp.status in (429, 500, 502, 503, 504):
                     sleep_s = min(LIST_BACKOFF_CAP, LIST_BASE_BACKOFF * (2 ** attempt))
@@ -311,8 +539,7 @@ async def fetch_list_page(session, offset: int):
                     or payload.get("result")
                     or (payload.get("payload") or {}).get("data")
                     or []
-)
-
+                )
 
                 ids = []
                 for u in users:
@@ -347,9 +574,18 @@ async def fetch_user_state(session, user_id: str):
     url = DETAIL_URL_TMPL.format(user_id=user_id)
 
     try:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            payload = await resp.json()
+        if not await ensure_auth_token(session):
+            raise RuntimeError("Auth token alınamadı. token_store.json içeriği kontrol edilmeli.")
+
+        async with session.get(url, headers=build_auth_headers()) as resp:
+            if resp.status == 401 and await ensure_auth_token(session, force=True):
+                logger.warning("[DETAIL RETRY] user_id=%s status=401 token refreshed", user_id)
+                async with session.get(url, headers=build_auth_headers()) as retry_resp:
+                    retry_resp.raise_for_status()
+                    payload = await retry_resp.json()
+            else:
+                resp.raise_for_status()
+                payload = await resp.json()
 
         profiles = payload.get("profiles", []) or []
 
@@ -408,7 +644,7 @@ async def process_ids(session, ids: List[str]) -> Tuple[int, int, List[dict]]:
 
 async def main():
     run_started_at = datetime.now(timezone.utc)
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=int(os.getenv("HTTP_TIMEOUT_SECONDS", "120")))
 
     connector = aiohttp.TCPConnector(
         limit=200,
@@ -417,10 +653,11 @@ async def main():
     )
 
     async with aiohttp.ClientSession(
-        headers=HEADERS,
         timeout=timeout,
         connector=connector
     ) as session:
+        if not await ensure_auth_token(session):
+            raise RuntimeError("Auth token alınamadı. token_store.json içeriği kontrol edilmeli.")
         checkpoint = load_checkpoint()
         start_page = 1
         scanned_total = 0

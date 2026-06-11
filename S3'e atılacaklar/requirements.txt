@@ -1,0 +1,12 @@
+pandas
+google-cloud-bigquery
+google-cloud-storage
+elasticsearch<9.0.0
+boto3
+aiohttp
+requests
+python-dotenv
+tqdm
+apache-airflow-providers-amazon
+apache-airflow-providers-google
+apache-airflow-providers-slack

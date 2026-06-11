@@ -1,0 +1,14 @@
+{
+  "run_started_at": "2026-06-08T12:23:47.044012+00:00",
+  "run_finished_at": "2026-06-08T12:40:10.262262+00:00",
+  "duration_seconds": 983.21825,
+  "duration_minutes": 16.39,
+  "active_total": 162379,
+  "scanned_total": 161796,
+  "kids_total": 2553,
+  "state_rows": 0,
+  "scan_mode": "full",
+  "max_pages": 0,
+  "page_size": 100,
+  "max_workers": 35
+}

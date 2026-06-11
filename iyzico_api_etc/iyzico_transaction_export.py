@@ -7,11 +7,14 @@ import hashlib
 import secrets
 import argparse
 from pathlib import Path
-from datetime import date, datetime, timedelta
+import tempfile
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Dict, List, Optional
+from google.api_core.exceptions import NotFound
 
 import pandas as pd
 import requests
+from google.cloud import bigquery
 from dotenv import load_dotenv
 
 
@@ -26,8 +29,20 @@ IYZICO_SECRET_KEY = os.getenv("IYZICO_SECRET_KEY", "").strip()
 
 OUT_DIR = Path(os.getenv("OUT_DIR", "./iyzico_outputs"))
 DEBUG = os.getenv("DEBUG", "0").strip() == "1"
+API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "120"))
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "3"))
+API_RETRY_SLEEP_SECONDS = int(os.getenv("API_RETRY_SLEEP_SECONDS", "5"))
 
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+WRITE_CSV = os.getenv("WRITE_CSV", "0").strip() == "1"
+BQ_ENABLED = os.getenv("BQ_ENABLED", "1").strip() == "1"
+BQ_PROJECT_ID = os.getenv("BQ_PROJECT_ID", "microgain-9f959").strip()
+BQ_DATASET = os.getenv("BQ_DATASET", "bc_t").strip()
+
+BQ_TABLE = os.getenv("BQ_TABLE", "iyzico_transactions_raw").strip()
+BQ_INSERT_BATCH_SIZE = int(os.getenv("BQ_INSERT_BATCH_SIZE", "500"))
+
+if WRITE_CSV:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 if not IYZICO_API_KEY or not IYZICO_SECRET_KEY:
     raise RuntimeError(
@@ -93,20 +108,55 @@ def get_daily_transactions(day_iso: str, page: int = 1, locale: str = "tr") -> D
         "locale": locale,
     }
 
-    resp = S.get(
-        url,
-        params=params,
-        headers=iyzws_headers(uri),
-        timeout=45,
+    last_error = None
+
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        try:
+            resp = S.get(
+                url,
+                params=params,
+                headers=iyzws_headers(uri),
+                timeout=API_TIMEOUT_SECONDS,
+            )
+
+            if DEBUG:
+                print("URL:", resp.url)
+                print("STATUS:", resp.status_code)
+                print(resp.text[:2000])
+
+            resp.raise_for_status()
+            return resp.json()
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            sleep_s = API_RETRY_SLEEP_SECONDS * attempt
+            print(
+                f"[WARN] Iyzico API timeout/connection error: "
+                f"date={day_iso} page={page} attempt={attempt}/{API_MAX_RETRIES} "
+                f"sleep={sleep_s}s err={type(e).__name__}"
+            )
+            time.sleep(sleep_s)
+
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            last_error = e
+
+            if status_code in (429, 500, 502, 503, 504):
+                sleep_s = API_RETRY_SLEEP_SECONDS * attempt
+                print(
+                    f"[WARN] Iyzico API retryable HTTP error: "
+                    f"date={day_iso} page={page} status={status_code} "
+                    f"attempt={attempt}/{API_MAX_RETRIES} sleep={sleep_s}s"
+                )
+                time.sleep(sleep_s)
+                continue
+
+            raise
+
+    raise RuntimeError(
+        f"Iyzico API request failed after {API_MAX_RETRIES} attempts: "
+        f"date={day_iso} page={page} error={last_error}"
     )
-
-    if DEBUG:
-        print("URL:", resp.url)
-        print("STATUS:", resp.status_code)
-        print(resp.text[:2000])
-
-    resp.raise_for_status()
-    return resp.json()
 
 
 def extract_transactions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -265,8 +315,197 @@ def fetch_transactions(start_date: date, end_date: date) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# =============================
+# BIGQUERY LOAD
+# =============================
+BQ_SCHEMA = [
+    bigquery.SchemaField("transaction_id", "STRING"),
+    bigquery.SchemaField("payment_tx_id", "STRING"),
+    bigquery.SchemaField("payment_id", "STRING"),
+    bigquery.SchemaField("conversation_id", "STRING"),
+    bigquery.SchemaField("basket_id", "STRING"),
+    bigquery.SchemaField("transaction_date", "STRING"),
+    bigquery.SchemaField("report_date", "DATE"),
+    bigquery.SchemaField("transaction_type", "STRING"),
+    bigquery.SchemaField("transaction_status", "STRING"),
+    bigquery.SchemaField("payment_phase", "STRING"),
+    bigquery.SchemaField("after_settlement", "STRING"),
+    bigquery.SchemaField("price", "FLOAT"),
+    bigquery.SchemaField("paid_price", "FLOAT"),
+    bigquery.SchemaField("amount", "FLOAT"),
+    bigquery.SchemaField("transaction_currency", "STRING"),
+    bigquery.SchemaField("settlement_currency", "STRING"),
+    bigquery.SchemaField("currency", "STRING"),
+    bigquery.SchemaField("installment", "INTEGER"),
+    bigquery.SchemaField("three_ds", "STRING"),
+    bigquery.SchemaField("iyzico_commission", "FLOAT"),
+    bigquery.SchemaField("iyzico_fee", "FLOAT"),
+    bigquery.SchemaField("merchant_payout_amount", "FLOAT"),
+    bigquery.SchemaField("sub_merchant_payout_amount", "FLOAT"),
+    bigquery.SchemaField("parity", "FLOAT"),
+    bigquery.SchemaField("iyzico_conversion_amount", "FLOAT"),
+    bigquery.SchemaField("connector_type", "STRING"),
+    bigquery.SchemaField("pos_order_id", "STRING"),
+    bigquery.SchemaField("auth_code", "STRING"),
+    bigquery.SchemaField("host_reference", "STRING"),
+    bigquery.SchemaField("raw_json", "STRING"),
+    bigquery.SchemaField("etl_loaded_at", "TIMESTAMP"),
+]
+
+
+FLOAT_COLUMNS = [
+    "price",
+    "paid_price",
+    "amount",
+    "iyzico_commission",
+    "iyzico_fee",
+    "merchant_payout_amount",
+    "sub_merchant_payout_amount",
+    "parity",
+    "iyzico_conversion_amount",
+]
+
+
+STRING_COLUMNS = [
+    "transaction_id",
+    "payment_tx_id",
+    "payment_id",
+    "conversation_id",
+    "basket_id",
+    "transaction_date",
+    "transaction_type",
+    "transaction_status",
+    "payment_phase",
+    "after_settlement",
+    "transaction_currency",
+    "settlement_currency",
+    "currency",
+    "three_ds",
+    "connector_type",
+    "pos_order_id",
+    "auth_code",
+    "host_reference",
+    "raw_json",
+]
+
+
+def prepare_bigquery_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    expected_columns = [field.name for field in BQ_SCHEMA]
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = None
+
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["etl_loaded_at"] = datetime.now(UTC).isoformat()
+
+    for col in FLOAT_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["installment"] = pd.to_numeric(df["installment"], errors="coerce").astype("Int64")
+
+    for col in STRING_COLUMNS:
+        df[col] = df[col].where(pd.notna(df[col]), None)
+        df[col] = df[col].apply(lambda x: None if x is None else str(x))
+
+    df = df[expected_columns]
+    df = df.where(pd.notna(df), None)
+    return df
+
+
+def sanitize_rows_for_bigquery(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sanitized_rows = []
+
+    for row in rows:
+        clean_row = {}
+
+        for key, value in row.items():
+            if pd.isna(value):
+                clean_row[key] = None
+            elif isinstance(value, (date, datetime)):
+                clean_row[key] = value.isoformat()
+            else:
+                clean_row[key] = value
+
+        sanitized_rows.append(clean_row)
+
+    return sanitized_rows
+
+
+def ensure_bigquery_table(client: bigquery.Client, table_id: str) -> None:
+    try:
+        client.get_table(table_id)
+        return
+    except NotFound:
+        table = bigquery.Table(table_id, schema=BQ_SCHEMA)
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field="report_date",
+        )
+        client.create_table(table)
+        print(f"[BQ] Table created: {table_id}")
+
+
+def delete_existing_bigquery_rows(client: bigquery.Client, table_id: str, start_date: date, end_date: date) -> None:
+    sql = f"""
+    DELETE FROM `{table_id}`
+    WHERE report_date BETWEEN @start_date AND @end_date
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start_date", "DATE", start_date.isoformat()),
+            bigquery.ScalarQueryParameter("end_date", "DATE", end_date.isoformat()),
+        ]
+    )
+    client.query(sql, job_config=job_config).result()
+    print(f"[BQ] Existing rows deleted: {table_id} / {start_date}..{end_date}")
+
+
+
+def load_to_bigquery(df: pd.DataFrame, start_date: date, end_date: date) -> None:
+    if not BQ_ENABLED:
+        print("[BQ] BQ_ENABLED=0, BigQuery load atlandı.")
+        return
+
+    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+    client = bigquery.Client(project=BQ_PROJECT_ID)
+    ensure_bigquery_table(client, table_id)
+    delete_existing_bigquery_rows(client, table_id, start_date, end_date)
+
+    df_bq = prepare_bigquery_dataframe(df)
+
+    rows = sanitize_rows_for_bigquery(df_bq.to_dict(orient="records"))
+    if not rows:
+        print(f"[BQ] Loaded rows: 0 → {table_id}")
+        return
+
+    with tempfile.NamedTemporaryFile(mode="w+b", suffix=".jsonl") as tmp_file:
+        for row in rows:
+            line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
+            tmp_file.write(line.encode("utf-8"))
+
+        tmp_file.flush()
+        tmp_file.seek(0)
+
+        job_config = bigquery.LoadJobConfig(
+            schema=BQ_SCHEMA,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+
+        load_job = client.load_table_from_file(
+            tmp_file,
+            table_id,
+            job_config=job_config,
+        )
+        load_job.result()
+
+    print(f"[BQ] Loaded rows: {len(rows)} → {table_id}")
+
+
 def resolve_dates(mode: str, start_arg: Optional[str], end_arg: Optional[str]):
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     yesterday = today - timedelta(days=1)
 
     if mode == "daily":
@@ -304,14 +543,17 @@ def main():
 
     df = fetch_transactions(start_date, end_date)
 
-    output_file = OUT_DIR / (
-        f"iyzico_transactions_{args.mode}_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv"
-    )
+    print(f"[OK] Rows fetched: {len(df)}")
 
-    df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    if WRITE_CSV:
+        output_file = OUT_DIR / (
+            f"iyzico_transactions_{args.mode}_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}.csv"
+        )
+        df.to_csv(output_file, index=False, encoding="utf-8-sig")
+        print(f"[OK] CSV saved: {output_file}")
 
-    print(f"[OK] Rows: {len(df)}")
-    print(f"[OK] Saved: {output_file}")
+    load_to_bigquery(df, start_date, end_date)
+    print("[OK] Iyzico export completed")
 
 
 if __name__ == "__main__":

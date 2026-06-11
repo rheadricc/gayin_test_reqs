@@ -1,0 +1,27 @@
+
+
+{
+  "GOOGLE_APPLICATION_CREDENTIALS_PATH": "/usr/local/airflow/keys/google_credentials.json",
+
+  "IYZICO_API_KEY": "XOlT06IMMXDokKjueP9KcojrmfIXpPcZ",
+  "IYZICO_SECRET_KEY": "pmpynjWQAOTG5yLGj36vw8eTkjLa6CPa",
+  "IYZICO_BASE_URL": "https://api.iyzipay.com",
+
+  "TURKPOS_SOAP_URL": "https://posws.param.com.tr/turkpos.ws/service_turkpos_prod.asmx",
+  "TURKPOS_CLIENT_CODE": "135835",
+  "TURKPOS_CLIENT_USERNAME": "TP10161597",
+  "TURKPOS_CLIENT_PASSWORD": "8507A98F0DA6A7FA",
+  "TURKPOS_GUID": "2A698BAC-FA8D-4490-A9F6-88193C21F6E6",
+
+  "PAYGURU_PRODUCT": "mp",
+  "PAYGURU_BASE_URL": "http://api.trend-tech.net",
+  "PAYGURU_MERCHANT_ID": "3031",
+  "PAYGURU_SERVICE_IDS": "3509,3513",
+
+  "NKOLAY_BASE_URL": "https://paynkolay.nkolayislem.com.tr",
+  "NKOLAY_LIST_SX": "188694342|nqwXqy4X8URxcx4u7IudxnSgD57jNE+K4/DIvOcss9ZFJXs79ZXVQBCijwVLwJiHL9yY4ysk1goOM/3Znb68G626GGGwj6flCoZ7Fu9BnAUnF9qiKsgff7J96zvgBKWH7Le9bw==|TfeZwKpUN15mnbAmdCBHPg==",
+  "NKOLAY_MERCHANT_SECRET_KEY": "_h1Bs2wH3R9YD9zaH8Q6Z",
+
+  "TCMB_BASE_URL": "https://www.tcmb.gov.tr/kurlar",
+  "TCMB_URL": "https://www.tcmb.gov.tr/kurlar/today.xml"
+}

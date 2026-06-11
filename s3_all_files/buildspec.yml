@@ -1,0 +1,53 @@
+version: 0.2
+
+env:
+  secrets-manager:
+    GITHUB_SSH_KEY: "arn:aws:secretsmanager:eu-west-1:711387140879:secret:codebuild/airflow/gitrepos-thiaeo"
+
+phases:
+  install:
+    commands:
+      - echo "Installing AWS CLI and dependencies..."
+      - pip install --upgrade awscli
+
+  pre_build:
+    commands:
+      - echo "Fetching changes from GitHub..."
+      - mkdir -p ~/.ssh
+      - echo "Fetching SSH key from Secrets Manager..."
+      - aws secretsmanager get-secret-value --secret-id arn:aws:secretsmanager:eu-west-1:711387140879:secret:codebuild/airflow/gitrepos-thiaeo --query SecretString --output text > ~/.ssh/id_ed25519
+      - chmod 600 ~/.ssh/id_ed25519
+      - git config --global core.sshCommand "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no"
+      - git config --global url."git@github.com:".insteadOf "https://github.com/"
+      - ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - git remote set-url origin git@github.com:gain-medya/bigdata-airflow-workflows.git
+      - git fetch --depth=2 origin master
+      - mkdir -p /tmp/workspace  # Geçici yazılabilir dizin
+      - git diff --name-only HEAD~1 > /tmp/workspace/diff.txt
+      - if [ -f /tmp/workspace/diff.txt ]; then
+          echo "diff.txt dosyası başarıyla oluşturuldu.";
+        else
+          echo "diff.txt oluşturulamadı.";
+        fi
+
+  build:
+    commands:
+      - echo "Processing changed files and copying to S3..."
+      - |
+        cat /tmp/workspace/diff.txt;
+        if [ -s /tmp/workspace/diff.txt ]; then
+          while IFS= read -r line; do
+            echo "Processing file: $line";
+            
+            if [ -f "$line" ]; then
+              echo "Copying $line to s3://gain-data-airflow-bucket/$line";
+              aws s3 cp "$line" "s3://gain-data-airflow-bucket/$line";
+            fi;
+          done < /tmp/workspace/diff.txt;
+        else
+          echo "No files to process.";
+        fi
+
+  post_build:
+    commands:
+      - echo "S3 update completed."
