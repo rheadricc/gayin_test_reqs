@@ -1,7 +1,9 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
 -- New name: BC_UNIT_ECONOMICS_DAILY_01
 -- Logic:
---   - TRY-only
+--   - TRY + foreign currency payments included
+--   - foreign currencies converted to TRY with TCMB forex_buying rate
+--   - if exact payment date rate is missing, latest available TCMB rate before payment date is used
 --   - PREPAID excluded
 --   - daily net revenue / active subscribers / ARPU
 --   - month-end MRR on last day of month
@@ -18,6 +20,17 @@ payment_option_config AS (
   SELECT 'MOBILE_PAYMENT'  AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
   SELECT 'CRAFTGATE'       AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
   SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+),
+
+tcmb_rates AS (
+  SELECT
+    DATE(rate_date) AS rate_date,
+    UPPER(currency_code) AS currency_code,
+    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+  FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
+  WHERE currency_code IS NOT NULL
+    AND forex_buying IS NOT NULL
+    AND unit IS NOT NULL
 ),
 
 subs_base AS (
@@ -37,22 +50,58 @@ subs_base AS (
       WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
       ELSE DATE(s.valid_until)
     END AS active_end_date,
-    CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64) AS amount_minor
+    UPPER(s.currency) AS currency_code,
+    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
   CROSS JOIN params p
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
     AND s.status IN ('ACTIVE','CANCELED', 'IN_GRACE', 'ON_HOLD')
-    AND UPPER(s.currency) = 'TRY'
     AND DATE(s.created_at) <= p.ds_end
+),
+
+subs_with_rate_candidates AS (
+  SELECT
+    s.*,
+    r.rate_date AS matched_rate_date,
+    r.rate_to_try,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        s.user_id,
+        s.payment_option,
+        s.currency_code,
+        s.created_at,
+        s.inserted_date,
+        s.valid_until_date,
+        CAST(s.amount_original AS STRING)
+      ORDER BY r.rate_date DESC
+    ) AS rate_rn
+  FROM subs_base s
+  LEFT JOIN tcmb_rates r
+    ON s.currency_code != 'TRY'
+   AND r.currency_code = s.currency_code
+   AND r.rate_date <= s.created_date
+),
+
+subs_converted AS (
+  SELECT
+    * EXCEPT(rate_rn),
+    CASE
+      WHEN currency_code = 'TRY' THEN amount_original
+      ELSE amount_original * rate_to_try
+    END AS amount_gross_tl
+  FROM subs_with_rate_candidates
+  WHERE currency_code = 'TRY'
+     OR rate_rn = 1
 ),
 
 subs AS (
   SELECT *
-  FROM subs_base
+  FROM subs_converted
   CROSS JOIN params p
   WHERE active_end_date >= p.ds_start
+    AND amount_gross_tl IS NOT NULL
 ),
 
 days AS (
@@ -66,7 +115,7 @@ daily_active_raw AS (
     d.dt,
     s.user_id,
     s.payment_option,
-    s.amount_minor,
+    s.amount_gross_tl,
     s.created_at,
     s.inserted_date
   FROM days d
@@ -79,7 +128,7 @@ daily_active_dedup AS (
     r.dt,
     r.user_id,
     r.payment_option,
-    r.amount_minor
+    r.amount_gross_tl
   FROM (
     SELECT
       r.*,
@@ -98,7 +147,7 @@ daily_user_revenue AS (
     a.user_id,
     a.payment_option,
     SAFE_DIVIDE(
-      SAFE_DIVIDE(a.amount_minor, 100.0)
+      a.amount_gross_tl
       * ((1.0 - COALESCE(c.commission_rate, 0.00)) * (1.0 - COALESCE(c.tax_rate, 0.20))),
       EXTRACT(DAY FROM LAST_DAY(a.dt))
     ) AS net_rev_tl
@@ -124,7 +173,7 @@ mrr_eom_daily AS (
   SELECT
     a.dt AS date,
     SUM(
-      SAFE_DIVIDE(a.amount_minor, 100.0)
+      a.amount_gross_tl
       * ((1.0 - COALESCE(c.commission_rate, 0.00)) * (1.0 - COALESCE(c.tax_rate, 0.20)))
     ) AS mrr_eom_tl
   FROM daily_active_dedup a

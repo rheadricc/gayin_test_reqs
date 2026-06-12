@@ -4,8 +4,11 @@
 -- Metric: realized cumulative LTV up to month-end
 -- REVIEW NOTE: Core LTV basis is active-day prorated realized net revenue.
 -- Logic:
---   - TRY-only
+--   - TRY + foreign currency payments included
+--   - Foreign currencies converted to TRY with TCMB forex_buying rate
+--   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
 --   - PREPAID excluded
+--   - CANCELED users are counted as active until valid_until
 --   - real net revenue per user-day
 --   - cumulative realized LTV by user
 --   - averaged over users active in each selected month
@@ -24,6 +27,17 @@ payment_option_config AS (
   SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
 ),
 
+tcmb_rates AS (
+  SELECT
+    DATE(rate_date) AS rate_date,
+    UPPER(currency_code) AS currency_code,
+    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+  FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
+  WHERE currency_code IS NOT NULL
+    AND forex_buying IS NOT NULL
+    AND unit IS NOT NULL
+),
+
 history_start AS (
   SELECT
     MIN(DATE(created_at)) AS hist_start
@@ -31,7 +45,6 @@ history_start AS (
   WHERE user_id IS NOT NULL
     AND payment_option IS NOT NULL
     AND payment_option != 'PREPAID'
-    AND UPPER(currency) = 'TRY'
 ),
 
 subs AS (
@@ -50,15 +63,15 @@ subs AS (
       WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
       ELSE DATE(s.valid_until)
     END AS active_end_date,
-    CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64) AS amount_minor
+    UPPER(TRIM(s.currency)) AS currency_code,
+    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
   CROSS JOIN params p
   CROSS JOIN history_start h
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
-    AND s.status IN ('ACTIVE', 'IN_GRACE', 'ON_HOLD')
-    AND UPPER(s.currency) = 'TRY'
+    AND s.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD')
     AND DATE(s.created_at) <= p.ds_end
     AND DATE(
       CASE
@@ -67,6 +80,41 @@ subs AS (
         ELSE s.valid_until
       END
     ) >= h.hist_start
+),
+
+subs_with_rate_candidates AS (
+  SELECT
+    s.*,
+    r.rate_date AS matched_rate_date,
+    r.rate_to_try,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        CAST(s.user_id AS STRING),
+        s.payment_option,
+        s.currency_code,
+        s.created_at,
+        s.inserted_date,
+        s.valid_until_date,
+        CAST(s.amount_original AS STRING)
+      ORDER BY r.rate_date DESC
+    ) AS rate_rn
+  FROM subs s
+  LEFT JOIN tcmb_rates r
+    ON s.currency_code != 'TRY'
+   AND r.currency_code = s.currency_code
+   AND r.rate_date <= s.created_date
+),
+
+subs_converted AS (
+  SELECT
+    * EXCEPT(rate_rn),
+    CASE
+      WHEN currency_code = 'TRY' THEN amount_original
+      ELSE amount_original * rate_to_try
+    END AS amount_gross_tl
+  FROM subs_with_rate_candidates
+  WHERE currency_code = 'TRY'
+     OR rate_rn = 1
 ),
 
 days AS (
@@ -81,12 +129,13 @@ daily_active_raw AS (
     d.dt,
     s.user_id,
     s.payment_option,
-    s.amount_minor,
+    s.amount_gross_tl,
     s.created_at,
     s.inserted_date
   FROM days d
-  JOIN subs s
+  JOIN subs_converted s
     ON d.dt BETWEEN s.created_date AND s.active_end_date
+   AND s.amount_gross_tl IS NOT NULL
 ),
 
 daily_active_dedup AS (
@@ -94,7 +143,7 @@ daily_active_dedup AS (
     r.dt,
     r.user_id,
     r.payment_option,
-    r.amount_minor
+    r.amount_gross_tl
   FROM (
     SELECT
       r.*,
@@ -112,7 +161,7 @@ daily_user_revenue AS (
     a.dt,
     a.user_id,
     SAFE_DIVIDE(
-      SAFE_DIVIDE(a.amount_minor, 100.0)
+      a.amount_gross_tl
       * ((1.0 - COALESCE(c.commission_rate, 0.00)) * (1.0 - COALESCE(c.tax_rate, 0.20))),
       EXTRACT(DAY FROM LAST_DAY(a.dt))
     ) AS net_rev_tl

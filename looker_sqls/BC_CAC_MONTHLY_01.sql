@@ -1,9 +1,9 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
 -- Name: BC_CAC_MONTHLY_01
 -- Output: monthly CAC by channel + blended all_channels
--- Standard logic:
 --   - spend source: bc_marketing_marts.ads_daily_spend
---   - TRY-only first paid users
+--   - TRY + foreign currency first paid users included
+--   - foreign currency payments are validated with TCMB forex_buying rate availability
 --   - PREPAID excluded
 --   - attribution = last eligible paid touch in the 30 days before first payment
 --   - one channel attribution per user
@@ -51,16 +51,72 @@ date_bounds AS (
   FROM spend
 ),
 
+tcmb_rates AS (
+  SELECT
+    DATE(rate_date) AS rate_date,
+    UPPER(currency_code) AS currency_code,
+    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+  FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
+  WHERE currency_code IS NOT NULL
+    AND forex_buying IS NOT NULL
+    AND unit IS NOT NULL
+),
+
+paid_payment_base AS (
+  SELECT
+    CAST(s.user_id AS STRING) AS user_id,
+    DATE(s.created_at) AS payment_date,
+    UPPER(TRIM(s.currency)) AS currency_code,
+    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
+  FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
+  CROSS JOIN date_bounds b
+  WHERE s.user_id IS NOT NULL
+    AND s.payment_option IS NOT NULL
+    AND UPPER(TRIM(s.payment_option)) != 'PREPAID'
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 0
+    AND DATE(s.created_at) <= LAST_DAY(b.max_month)
+),
+
+paid_payment_rate_candidates AS (
+  SELECT
+    p.*,
+    r.rate_date AS matched_rate_date,
+    r.rate_to_try,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        p.user_id,
+        p.payment_date,
+        p.currency_code,
+        CAST(p.amount_original AS STRING)
+      ORDER BY r.rate_date DESC
+    ) AS rate_rn
+  FROM paid_payment_base p
+  LEFT JOIN tcmb_rates r
+    ON p.currency_code != 'TRY'
+   AND r.currency_code = p.currency_code
+   AND r.rate_date <= p.payment_date
+),
+
+paid_payments AS (
+  SELECT
+    user_id,
+    payment_date,
+    currency_code,
+    amount_original,
+    matched_rate_date,
+    rate_to_try
+  FROM paid_payment_rate_candidates
+  WHERE currency_code = 'TRY'
+     OR rate_rn = 1
+),
+
 first_paid AS (
   SELECT
-    CAST(user_id AS STRING) AS user_id,
-    MIN(DATE(created_at)) AS first_paid_date
-  FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment`
-  WHERE user_id IS NOT NULL
-    AND payment_option IS NOT NULL
-    AND UPPER(TRIM(payment_option)) != 'PREPAID'
-    AND COALESCE(amount, amount_before_promotions, 0) > 0
-    AND UPPER(TRIM(currency)) = 'TRY'
+    user_id,
+    MIN(payment_date) AS first_paid_date
+  FROM paid_payments
+  WHERE currency_code = 'TRY'
+     OR rate_to_try IS NOT NULL
   GROUP BY user_id
 ),
 

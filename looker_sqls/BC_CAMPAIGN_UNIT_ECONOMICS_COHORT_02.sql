@@ -4,14 +4,7 @@
 -- Granularity:
 --   1 row per user per lifetime month
 --
--- Core logic:
---   - cohort start = user's FIRST REAL PAID DATE
---   - cohort_type = CAMPAIGN if user had a promotion attached on/before first paid date
---   - TRY only
---   - PREPAID excluded
---   - actual revenue = amount
---   - no-promo comparable revenue = amount_before_promotions
---   - blended monthly CAC = total monthly spend / monthly acquired users
+--   - blended monthly CAC = ads_daily_spend monthly total spend / monthly acquired users
 --
 -- Notes:
 --   - CAC is blended monthly CAC, same for NORMAL and CAMPAIGN within same cohort_month
@@ -31,6 +24,17 @@ payment_option_config AS (
   SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
 ),
 
+tcmb_rates AS (
+  SELECT
+    DATE(rate_date) AS rate_date,
+    UPPER(currency_code) AS currency_code,
+    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+  FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
+  WHERE currency_code IS NOT NULL
+    AND forex_buying IS NOT NULL
+    AND unit IS NOT NULL
+),
+
 /* =====================================================
    1) BASE SUBS DATA
    ===================================================== */
@@ -39,7 +43,7 @@ subs_base AS (
     s.user_id,
     s.status,
     s.payment_option,
-    UPPER(s.currency) AS currency,
+    UPPER(TRIM(s.currency)) AS currency_code,
     s.created_at,
     s.inserted_date,
     DATE(s.created_at) AS created_date,
@@ -55,8 +59,8 @@ subs_base AS (
       ELSE DATE(s.valid_until)
     END AS active_end_date,
 
-    CAST(COALESCE(s.amount, 0) AS FLOAT64) AS actual_amount_minor,
-    CAST(COALESCE(s.amount_before_promotions, s.amount, 0) AS FLOAT64) AS before_promo_amount_minor,
+    SAFE_DIVIDE(CAST(COALESCE(s.amount, 0) AS FLOAT64), 100.0) AS actual_amount_original,
+    SAFE_DIVIDE(CAST(COALESCE(s.amount_before_promotions, s.amount, 0) AS FLOAT64), 100.0) AS before_promo_amount_original,
 
     s.applied_promotions
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
@@ -64,8 +68,54 @@ subs_base AS (
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
-    AND UPPER(s.currency) = 'TRY'
     AND DATE(s.created_at) <= p.ds_end
+),
+
+subs_with_rate_candidates AS (
+  SELECT
+    s.*,
+    r.rate_date AS matched_rate_date,
+    r.rate_to_try,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        CAST(s.user_id AS STRING),
+        s.payment_option,
+        s.currency_code,
+        s.created_at,
+        s.inserted_date,
+        s.valid_until_date,
+        CAST(s.actual_amount_original AS STRING),
+        CAST(s.before_promo_amount_original AS STRING)
+      ORDER BY r.rate_date DESC
+    ) AS rate_rn
+  FROM subs_base s
+  LEFT JOIN tcmb_rates r
+    ON s.currency_code != 'TRY'
+   AND r.currency_code = s.currency_code
+   AND r.rate_date <= s.created_date
+),
+
+subs_converted AS (
+  SELECT
+    * EXCEPT(rate_rn),
+    CASE
+      WHEN currency_code = 'TRY' THEN actual_amount_original
+      ELSE actual_amount_original * rate_to_try
+    END AS actual_amount_gross_tl,
+    GREATEST(
+      CASE
+        WHEN currency_code = 'TRY' THEN before_promo_amount_original
+        WHEN UPPER(TRIM(payment_option)) IN ('APP_STORE', 'PLAY_STORE') THEN before_promo_amount_original
+        ELSE before_promo_amount_original * rate_to_try
+      END,
+      CASE
+        WHEN currency_code = 'TRY' THEN actual_amount_original
+        ELSE actual_amount_original * rate_to_try
+      END
+    ) AS before_promo_amount_gross_tl
+  FROM subs_with_rate_candidates
+  WHERE currency_code = 'TRY'
+     OR rate_rn = 1
 ),
 
 /* =====================================================
@@ -83,8 +133,8 @@ first_paid_raw AS (
       PARTITION BY s.user_id
       ORDER BY s.created_at ASC, s.inserted_date ASC
     ) AS rn
-  FROM subs_base s
-  WHERE s.actual_amount_minor > 0
+  FROM subs_converted s
+  WHERE s.actual_amount_gross_tl > 0
 ),
 
 first_paid AS (
@@ -130,7 +180,7 @@ promo_before_first_paid AS (
       ORDER BY COALESCE(ap.applyDate, sb.created_at) ASC, sb.created_at ASC
     ) AS rn
   FROM cohort_users cu
-  JOIN subs_base sb
+  JOIN subs_converted sb
     ON cu.user_id = sb.user_id
    AND sb.created_date <= cu.first_paid_date
   CROSS JOIN UNNEST(sb.applied_promotions) ap
@@ -216,19 +266,20 @@ daily_active_raw AS (
     sb.inserted_date,
 
     SAFE_DIVIDE(
-      SAFE_DIVIDE(sb.actual_amount_minor, 100.0)
+      sb.actual_amount_gross_tl
       * ((1.0 - COALESCE(cfg.commission_rate, 0.00)) * (1.0 - COALESCE(cfg.tax_rate, 0.20))),
       EXTRACT(DAY FROM LAST_DAY(d))
     ) AS actual_net_rev_tl_day,
 
     SAFE_DIVIDE(
-      SAFE_DIVIDE(sb.before_promo_amount_minor, 100.0)
+      sb.before_promo_amount_gross_tl
       * ((1.0 - COALESCE(cfg.commission_rate, 0.00)) * (1.0 - COALESCE(cfg.tax_rate, 0.20))),
       EXTRACT(DAY FROM LAST_DAY(d))
     ) AS gross_net_rev_before_promo_tl_day
-  FROM subs_base sb
+  FROM subs_converted sb
   JOIN cohort_labeled cl
     ON sb.user_id = cl.user_id
+   AND sb.actual_amount_gross_tl IS NOT NULL
   LEFT JOIN payment_option_config cfg
     ON sb.payment_option = cfg.payment_option
   CROSS JOIN params p
@@ -363,11 +414,12 @@ user_month_final AS (
    ===================================================== */
 monthly_spend AS (
   SELECT
-    DATE(month) AS cohort_month,
+    DATE_TRUNC(DATE(day), MONTH) AS cohort_month,
     SUM(spend_tl) AS total_spend_tl
-  FROM `microgain-9f959.bc_marketing_raw.manual_monthly_spend`
-  WHERE UPPER(currency) = 'TRY'
-  GROUP BY DATE(month)
+  FROM `microgain-9f959.bc_marketing_marts.ads_daily_spend`
+  CROSS JOIN params p
+  WHERE DATE(day) BETWEEN DATE_TRUNC(p.ds_start, MONTH) AND p.ds_end
+  GROUP BY cohort_month
 ),
 
 monthly_acquired_users AS (

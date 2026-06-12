@@ -4,8 +4,9 @@
 -- Keep only if the intended metric is lifetime payment-sum by first watched category; otherwise align to active-day LTV.
 -- Logic:
 --   - first category = user's first meaningful watched content's first genre
---   - LTV = TRY-only realized LTV (real payment sum net of commission/tax)
---   - final = average LTV by first category
+--   - LTV = TRY + foreign currency realized LTV (real payment sum net of commission/tax)
+--   - Foreign currencies converted to TRY with TCMB forex_buying rate
+--   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
 
 WITH params AS (
   SELECT
@@ -83,7 +84,7 @@ first_category AS (
 ),
 
 /* =====================================================
-   2) USER LTV (TRY-ONLY REALIZED)
+   2) USER LTV (TRY + FX CONVERTED REALIZED)
    ===================================================== */
 
 payment_option_config AS (
@@ -94,21 +95,64 @@ payment_option_config AS (
   SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
 ),
 
+tcmb_rates AS (
+  SELECT
+    DATE(rate_date) AS rate_date,
+    UPPER(currency_code) AS currency_code,
+    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+  FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
+  WHERE currency_code IS NOT NULL
+    AND forex_buying IS NOT NULL
+    AND unit IS NOT NULL
+),
+
 base_payments AS (
   SELECT
     CAST(s.user_id AS STRING) AS user_id,
     DATE(s.created_at) AS payment_date,
     s.payment_option,
-    UPPER(TRIM(s.currency)) AS currency,
-    CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS INT64) AS amount_minor,
+    UPPER(TRIM(s.currency)) AS currency_code,
+    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original,
     s.created_at,
     s.inserted_date
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
-    AND UPPER(TRIM(s.currency)) = 'TRY'
     AND COALESCE(s.amount, s.amount_before_promotions, 0) > 0
+),
+
+payment_rate_candidates AS (
+  SELECT
+    b.*,
+    r.rate_date AS matched_rate_date,
+    r.rate_to_try,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        b.user_id,
+        b.payment_date,
+        b.payment_option,
+        b.currency_code,
+        CAST(b.amount_original AS STRING)
+      ORDER BY r.rate_date DESC
+    ) AS rate_rn
+  FROM base_payments b
+  LEFT JOIN tcmb_rates r
+    ON b.currency_code != 'TRY'
+   AND r.currency_code = b.currency_code
+   AND r.rate_date <= b.payment_date
+),
+
+payments_converted AS (
+  SELECT
+    * EXCEPT(rate_rn),
+    CASE
+      WHEN currency_code = 'TRY' THEN amount_original
+      ELSE amount_original * rate_to_try
+    END AS amount_gross_tl
+  FROM payment_rate_candidates
+  WHERE currency_code = 'TRY'
+     OR rate_rn = 1
 ),
 
 dedup_payments AS (
@@ -116,7 +160,7 @@ dedup_payments AS (
     user_id,
     payment_date,
     payment_option,
-    amount_minor
+    amount_gross_tl
   FROM (
     SELECT
       b.*,
@@ -125,10 +169,12 @@ dedup_payments AS (
           b.user_id,
           b.payment_date,
           b.payment_option,
-          b.amount_minor
+          b.currency_code,
+          CAST(b.amount_gross_tl AS STRING)
         ORDER BY b.created_at DESC, b.inserted_date DESC
       ) AS rn
-    FROM base_payments b
+    FROM payments_converted b
+    WHERE b.amount_gross_tl IS NOT NULL
   )
   WHERE rn = 1
 ),
@@ -137,7 +183,7 @@ net_payments AS (
   SELECT
     p.user_id,
     p.payment_date,
-    SAFE_DIVIDE(CAST(p.amount_minor AS FLOAT64), 100.0)
+    p.amount_gross_tl
       * (1.0 - COALESCE(c.commission_rate, 0.00))
       * (1.0 - COALESCE(c.tax_rate, 0.20)) AS net_payment_tl
   FROM dedup_payments p

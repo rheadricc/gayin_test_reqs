@@ -1,5 +1,5 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
--- Output: Heavy vs Light watcher LTV (TRY-only, paying users only)
+-- Output: Heavy vs Light watcher LTV (TRY + foreign currency, paying users only)
 -- REVIEW NOTE: This uses active-day prorated LTV and is closer to monthly realized LTV logic.
 -- Logic:
 --   - cohort window shifted back by 90 days
@@ -9,8 +9,11 @@
 --   - Heavy = top 30%
 --   - Middle excluded
 --   - daily watch outliers above 24h are excluded from segmentation
---   - LTV uses TRY-only realized lifetime value
---   - only users with TRY LTV are included
+--   - LTV uses TRY + foreign currency realized lifetime value
+--   - Foreign currencies converted to TRY with TCMB forex_buying rate
+--   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
+--   - CANCELED users are counted as active until valid_until
+--   - only users with converted TL LTV are included
 
 WITH params AS (
   SELECT
@@ -143,7 +146,7 @@ watcher_segment AS (
 ),
 
 /* =====================================================
-   5) TRY-ONLY USER LTV
+   5) USER LTV - TRY + FX CONVERTED TO TL
    ===================================================== */
 payment_option_config AS (
   SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
@@ -153,11 +156,22 @@ payment_option_config AS (
   SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
 ),
 
+tcmb_rates AS (
+  SELECT
+    DATE(rate_date) AS rate_date,
+    UPPER(currency_code) AS currency_code,
+    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+  FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
+  WHERE currency_code IS NOT NULL
+    AND forex_buying IS NOT NULL
+    AND unit IS NOT NULL
+),
+
 subs AS (
   SELECT
     s.user_id,
     s.payment_option,
-    s.currency,
+    UPPER(TRIM(s.currency)) AS currency_code,
     s.status,
     s.created_at,
     s.inserted_date,
@@ -170,13 +184,47 @@ subs AS (
       WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
       ELSE DATE(s.valid_until)
     END AS active_end_date,
-    CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64) AS amount_minor
+    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
-    AND s.currency = 'TRY'
-    AND s.status IN ('ACTIVE', 'IN_GRACE', 'ON_HOLD')
+    AND s.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD')
+),
+
+subs_with_rate_candidates AS (
+  SELECT
+    s.*,
+    r.rate_date AS matched_rate_date,
+    r.rate_to_try,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        CAST(s.user_id AS STRING),
+        s.payment_option,
+        s.currency_code,
+        s.created_at,
+        s.inserted_date,
+        s.valid_until_date,
+        CAST(s.amount_original AS STRING)
+      ORDER BY r.rate_date DESC
+    ) AS rate_rn
+  FROM subs s
+  LEFT JOIN tcmb_rates r
+    ON s.currency_code != 'TRY'
+   AND r.currency_code = s.currency_code
+   AND r.rate_date <= s.created_date
+),
+
+subs_converted AS (
+  SELECT
+    * EXCEPT(rate_rn),
+    CASE
+      WHEN currency_code = 'TRY' THEN amount_original
+      ELSE amount_original * rate_to_try
+    END AS amount_gross_tl
+  FROM subs_with_rate_candidates
+  WHERE currency_code = 'TRY'
+     OR rate_rn = 1
 ),
 
 days AS (
@@ -191,12 +239,13 @@ daily_active_raw AS (
     d.dt,
     s.user_id,
     s.payment_option,
-    s.amount_minor,
+    s.amount_gross_tl,
     s.created_at,
     s.inserted_date
   FROM days d
-  JOIN subs s
+  JOIN subs_converted s
     ON d.dt BETWEEN s.created_date AND s.active_end_date
+   AND s.amount_gross_tl IS NOT NULL
 ),
 
 daily_active_dedup AS (
@@ -204,7 +253,7 @@ daily_active_dedup AS (
     r.dt,
     r.user_id,
     r.payment_option,
-    r.amount_minor
+    r.amount_gross_tl
   FROM (
     SELECT
       r.*,
@@ -222,7 +271,7 @@ daily_revenue AS (
     a.dt,
     a.user_id,
     SAFE_DIVIDE(
-      SAFE_DIVIDE(a.amount_minor, 100.0)
+      a.amount_gross_tl
       * (1.0 - COALESCE(c.commission_rate, 0.00))
       * (1.0 - COALESCE(c.tax_rate, 0.20)),
       EXTRACT(DAY FROM LAST_DAY(a.dt))
