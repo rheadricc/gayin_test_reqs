@@ -160,7 +160,7 @@ def write_snapshot_to_bq(source: str = "backoffice_api"):
       COUNT(*) AS active_total,
       COUNTIF(has_kid_profile) AS kids_total
     FROM `{USER_STATE_TABLE}`
-    WHERE subscription_status IN ('ACTIVE', 'IN_GRACE', 'ON_HOLD')
+    WHERE subscription_status IN ('ACTIVE', 'CANCELED')
     """
 
     result = list(client.query(summary_sql).result())[0]

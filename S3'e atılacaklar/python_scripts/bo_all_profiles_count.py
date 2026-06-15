@@ -8,8 +8,6 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import boto3
 from botocore.exceptions import ClientError
-from dotenv import load_dotenv
-from tqdm import tqdm
 
 try:
     from google.cloud import bigquery
@@ -17,8 +15,9 @@ except ImportError:
     bigquery = None
 
 
-ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
-load_dotenv(ENV_PATH)
+SCRIPT_VERSION = "bo_all_profiles_count_no_dotenv_no_tqdm_v2"
+
+
 
 BASE_URL = os.getenv("PROD_BASE_URL", "https://api.gain.tv/2da7kf8jf").rstrip("/")
 
@@ -133,7 +132,7 @@ def get_default_bq_target_users_sql() -> str:
 def get_bigquery_client():
     if bigquery is None:
         raise ImportError("google-cloud-bigquery paketi bulunamadı.")
-    return bigquery.Client(project=BQ_PROJECT_ID or None)
+    return bigquery.Client(project=BQ_PROJECT_ID)
 
 
 def load_target_user_ids_from_bigquery():
@@ -283,7 +282,9 @@ async def process_ids(session, user_ids):
 
     tasks = [bounded(user_id) for user_id in user_ids]
 
-    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), leave=False):
+    total_tasks = len(tasks)
+
+    for coro in asyncio.as_completed(tasks):
         profile_count = await coro
         scanned_accounts += 1
         total_profiles += profile_count
@@ -296,12 +297,17 @@ async def process_ids(session, user_ids):
         elif profile_count > 1:
             multi_profile_users += 1
 
+        if scanned_accounts == 1 or scanned_accounts % 1000 == 0 or scanned_accounts == total_tasks:
+            print(f"[PROGRESS] scanned={scanned_accounts}/{total_tasks}")
+
     return scanned_accounts, users_with_profiles, total_profiles, multi_profile_users, single_profile_users
 
 
 async def main():
     if not BASE_URL:
         raise ValueError("PROD_BASE_URL boş.")
+
+    print(f"[SCRIPT VERSION] {SCRIPT_VERSION}")
 
     auth_headers = build_auth_headers()
     if not auth_headers.get("Authorization"):
