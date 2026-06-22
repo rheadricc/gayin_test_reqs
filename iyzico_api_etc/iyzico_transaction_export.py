@@ -537,7 +537,34 @@ def main():
     )
     parser.add_argument("--start-date", help="YYYY-MM-DD")
     parser.add_argument("--end-date", help="YYYY-MM-DD")
+    parser.add_argument(
+        "--csv-only",
+        action="store_true",
+        help="Sadece CSV çıktı üretir; BigQuery yüklemesini kapatır.",
+    )
+    parser.add_argument(
+        "--write-csv",
+        action="store_true",
+        help="CSV çıktı üretimini aktif eder.",
+    )
+    parser.add_argument(
+        "--no-bq",
+        action="store_true",
+        help="BigQuery yüklemesini kapatır.",
+    )
     args = parser.parse_args()
+
+    global WRITE_CSV, BQ_ENABLED
+    if args.csv_only:
+        WRITE_CSV = True
+        BQ_ENABLED = False
+    if args.write_csv:
+        WRITE_CSV = True
+    if args.no_bq:
+        BQ_ENABLED = False
+
+    if WRITE_CSV:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     start_date, end_date = resolve_dates(args.mode, args.start_date, args.end_date)
 
@@ -551,6 +578,8 @@ def main():
         )
         df.to_csv(output_file, index=False, encoding="utf-8-sig")
         print(f"[OK] CSV saved: {output_file}")
+    else:
+        print("[CSV] WRITE_CSV=0 ve --write-csv/--csv-only verilmediği için CSV yazılmadı.")
 
     load_to_bigquery(df, start_date, end_date)
     print("[OK] Iyzico export completed")

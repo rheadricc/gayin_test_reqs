@@ -1,22 +1,11 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
--- Output: category-level average realized LTV
--- REVIEW NOTE: This query uses raw payment-sum realized LTV, while monthly realized LTV uses prorated active-day revenue.
--- Keep only if the intended metric is lifetime payment-sum by first watched category; otherwise align to active-day LTV.
--- Logic:
---   - first category = user's first meaningful watched content's first genre
---   - LTV = TRY + foreign currency realized LTV (real payment sum net of commission/tax)
---   - Foreign currencies converted to TRY with TCMB forex_buying rate
---   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
+-- Output: subscription-start first watch analysis by CONTENT and GENRE
 
 WITH params AS (
   SELECT
     PARSE_DATE('%Y%m%d', @DS_START_DATE) AS ds_start,
     PARSE_DATE('%Y%m%d', @DS_END_DATE)   AS ds_end
 ),
-
-/* =====================================================
-   1) FIRST CATEGORY
-   ===================================================== */
 
 contents AS (
   SELECT
@@ -27,65 +16,6 @@ contents AS (
   WHERE video_id IS NOT NULL
   GROUP BY video_id
 ),
-
-all_stream AS (
-  SELECT
-    CAST(user_id AS STRING) AS user_id,
-    CAST(video_id AS STRING) AS video_id,
-    Datetime_Ist,
-    event_date
-  FROM `microgain-9f959.looker_report.content_report_streaming_V2`
-  WHERE user_id IS NOT NULL
-    AND video_id IS NOT NULL
-    AND Datetime_Ist IS NOT NULL
-),
-
-stream_with_genre AS (
-  SELECT
-    s.user_id,
-    s.video_id,
-    s.Datetime_Ist,
-    s.event_date,
-    c.genre
-  FROM all_stream s
-  JOIN contents c
-    ON TRIM(s.video_id) = TRIM(c.video_id)
-  WHERE c.genre IS NOT NULL
-    AND TRIM(c.genre) != ''
-),
-
-first_valid_watch AS (
-  SELECT
-    user_id,
-    event_date AS first_watch_date,
-    video_id AS first_video_id,
-    genre AS first_category
-  FROM (
-    SELECT
-      s.*,
-      ROW_NUMBER() OVER (
-        PARTITION BY s.user_id
-        ORDER BY s.Datetime_Ist ASC, s.video_id ASC
-      ) AS rn
-    FROM stream_with_genre s
-  )
-  WHERE rn = 1
-),
-
-first_category AS (
-  SELECT
-    user_id,
-    first_watch_date,
-    first_video_id,
-    first_category
-  FROM first_valid_watch
-  CROSS JOIN params p
-  WHERE first_watch_date BETWEEN p.ds_start AND p.ds_end
-),
-
-/* =====================================================
-   2) USER LTV (TRY + FX CONVERTED REALIZED)
-   ===================================================== */
 
 payment_option_config AS (
   SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
@@ -191,6 +121,23 @@ net_payments AS (
     ON p.payment_option = c.payment_option
 ),
 
+subscription_start AS (
+  SELECT
+    user_id,
+    MIN(payment_date) AS subscription_start_date
+  FROM net_payments
+  GROUP BY user_id
+),
+
+selected_subscribers AS (
+  SELECT
+    s.user_id,
+    s.subscription_start_date
+  FROM subscription_start s
+  CROSS JOIN params p
+  WHERE s.subscription_start_date BETWEEN p.ds_start AND p.ds_end
+),
+
 user_ltv AS (
   SELECT
     user_id,
@@ -202,34 +149,98 @@ user_ltv AS (
   GROUP BY user_id
 ),
 
-/* =====================================================
-   3) FINAL AGG
-   ===================================================== */
-
-final AS (
+stream_events AS (
   SELECT
-    f.first_category,
-    COUNT(DISTINCT f.user_id) AS users,
+    CAST(s.user_id AS STRING) AS user_id,
+    CAST(s.video_id AS STRING) AS video_id,
+    s.Datetime_Ist,
+    s.event_date,
+    c.content_name,
+    c.genre
+  FROM `microgain-9f959.looker_report.content_report_streaming_V2` s
+  JOIN contents c
+    ON TRIM(CAST(s.video_id AS STRING)) = TRIM(c.video_id)
+  WHERE s.user_id IS NOT NULL
+    AND s.video_id IS NOT NULL
+    AND s.Datetime_Ist IS NOT NULL
+    AND c.content_name IS NOT NULL
+    AND TRIM(c.content_name) != ''
+    AND c.genre IS NOT NULL
+    AND TRIM(c.genre) != ''
+),
+
+first_watch_after_subscription AS (
+  SELECT
+    user_id,
+    subscription_start_date,
+    event_date AS first_watch_date,
+    video_id AS first_video_id,
+    content_name AS first_content_name,
+    genre AS first_genre
+  FROM (
+    SELECT
+      ss.user_id,
+      ss.subscription_start_date,
+      se.event_date,
+      se.Datetime_Ist,
+      se.video_id,
+      se.content_name,
+      se.genre,
+      ROW_NUMBER() OVER (
+        PARTITION BY ss.user_id
+        ORDER BY se.Datetime_Ist ASC, se.video_id ASC
+      ) AS rn
+    FROM selected_subscribers ss
+    JOIN stream_events se
+      ON ss.user_id = se.user_id
+     AND se.event_date >= ss.subscription_start_date
+  )
+  WHERE rn = 1
+),
+
+content_agg AS (
+  SELECT
+    'CONTENT' AS breakdown_type,
+    first_content_name AS breakdown_name,
+    COUNT(DISTINCT f.user_id) AS first_watch_users,
     AVG(COALESCE(l.user_ltv_tl, 0)) AS avg_ltv_tl,
     APPROX_QUANTILES(COALESCE(l.user_ltv_tl, 0), 100)[OFFSET(50)] AS median_ltv_tl,
-    MIN(COALESCE(l.user_ltv_tl, 0)) AS min_ltv_tl,
-    MAX(COALESCE(l.user_ltv_tl, 0)) AS max_ltv_tl,
     SUM(COALESCE(l.user_ltv_tl, 0)) AS total_ltv_tl,
     AVG(COALESCE(l.payment_count, 0)) AS avg_payment_count
-  FROM first_category f
+  FROM first_watch_after_subscription f
   LEFT JOIN user_ltv l
     ON f.user_id = l.user_id
-  GROUP BY f.first_category
+  GROUP BY first_content_name
+),
+
+genre_agg AS (
+  SELECT
+    'GENRE' AS breakdown_type,
+    first_genre AS breakdown_name,
+    COUNT(DISTINCT f.user_id) AS first_watch_users,
+    AVG(COALESCE(l.user_ltv_tl, 0)) AS avg_ltv_tl,
+    APPROX_QUANTILES(COALESCE(l.user_ltv_tl, 0), 100)[OFFSET(50)] AS median_ltv_tl,
+    SUM(COALESCE(l.user_ltv_tl, 0)) AS total_ltv_tl,
+    AVG(COALESCE(l.payment_count, 0)) AS avg_payment_count
+  FROM first_watch_after_subscription f
+  LEFT JOIN user_ltv l
+    ON f.user_id = l.user_id
+  GROUP BY first_genre
+),
+
+final AS (
+  SELECT * FROM content_agg
+  UNION ALL
+  SELECT * FROM genre_agg
 )
 
 SELECT
-  first_category,
-  users,
+  breakdown_type,
+  breakdown_name,
+  first_watch_users,
   avg_ltv_tl,
   median_ltv_tl,
-  min_ltv_tl,
-  max_ltv_tl,
   total_ltv_tl,
   avg_payment_count
 FROM final
-ORDER BY avg_ltv_tl DESC, users DESC;
+ORDER BY breakdown_type, first_watch_users DESC, avg_ltv_tl DESC;

@@ -1,0 +1,153 @@
+from datetime import datetime, timedelta
+import importlib.util
+import os
+import sys
+import tempfile
+
+import boto3
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
+from google.cloud import bigquery
+
+
+S3_BUCKET = "gain-data-airflow-bucket"
+SCRIPT_S3_KEY = "python_scripts/google_transaction_combo.py"
+
+DEFAULT_ARGS = {
+    "owner": "data-team",
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=30),
+}
+
+
+def send_slack_notification(context, success):
+    task_instance = context["task_instance"]
+    duration = task_instance.duration
+    duration_text = f"{duration:.1f}s" if duration is not None else "n/a"
+    log_url = task_instance.log_url
+
+    if success:
+        result = task_instance.xcom_pull(
+            task_ids=task_instance.task_id,
+            key="return_value",
+        ) or {}
+        text = (
+            ":white_check_mark: *Google Play finance load succeeded*\n"
+            f"*Target date:* {result.get('target_date', 'n/a')}\n"
+            f"*Loaded rows:* {result.get('row_count', 'n/a')}\n"
+            f"*BigQuery table:* `{result.get('table_id', 'n/a')}`\n"
+            f"*Duration:* {duration_text}\n"
+            f"<{log_url}|Open Airflow log>"
+        )
+    else:
+        exception = context.get("exception")
+        exception_text = str(exception)[:1000] if exception else "Unknown error"
+        text = (
+            "<!channel>\n"
+            ":red_circle: *Google Play finance load failed*\n"
+            f"*Target:* T-1\n"
+            f"*Task:* `{task_instance.task_id}`\n"
+            f"*Final try:* {task_instance.try_number}\n"
+            f"*Error:* `{exception_text}`\n"
+            f"<{log_url}|Open Airflow log>"
+        )
+
+    SlackWebhookHook(slack_webhook_conn_id="slack_default").send(text=text)
+
+
+def notify_success(context):
+    send_slack_notification(context, success=True)
+
+
+def notify_failure(context):
+    send_slack_notification(context, success=False)
+
+
+def download_and_import_script(bucket_name, s3_key, module_name):
+    local_path = os.path.join(tempfile.gettempdir(), f"{module_name}.py")
+    boto3.client("s3").download_file(bucket_name, s3_key, local_path)
+
+    spec = importlib.util.spec_from_file_location(module_name, local_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def patch_bigquery_client(module, gcp_conn_id="google_cloud_default"):
+    hook = BigQueryHook(gcp_conn_id=gcp_conn_id)
+    credentials = hook.get_credentials()
+    project_id = hook.project_id or "microgain-9f959"
+    original_client = bigquery.Client
+
+    def airflow_bigquery_client(*args, **kwargs):
+        project = kwargs.get("project") or project_id
+        return original_client(credentials=credentials, project=project)
+
+    module.bigquery.Client = airflow_bigquery_client
+
+
+def run_google_play_daily(**kwargs):
+    os.environ.update(
+        {
+            "RUNNING_IN_AIRFLOW": "1",
+            "WRITE_CSV": "0",
+            "BQ_ENABLED": "1",
+            "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON": Variable.get(
+                "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"
+            ),
+            "GOOGLE_PLAY_BUCKET_NAME": Variable.get(
+                "GOOGLE_PLAY_BUCKET_NAME",
+                default_var="pubsite_prod_9095964761589449343",
+            ),
+            "BQ_PROJECT_ID": Variable.get(
+                "FINANCE_BQ_PROJECT_ID",
+                default_var="microgain-9f959",
+            ),
+            "BQ_DATASET": Variable.get(
+                "FINANCE_BQ_DATASET",
+                default_var="bc_t",
+            ),
+            "BQ_TABLE": Variable.get(
+                "GOOGLE_PLAY_BQ_TABLE",
+                default_var="googleplay_transactions_raw",
+            ),
+        }
+    )
+
+    module = download_and_import_script(
+        S3_BUCKET,
+        SCRIPT_S3_KEY,
+        "google_transaction_combo_daily",
+    )
+    patch_bigquery_client(module)
+
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = ["google_transaction_combo.py", "daily"]
+        return module.export_sales("daily")
+    finally:
+        sys.argv = old_argv
+
+
+with DAG(
+    dag_id="google_play_sales_daily",
+    default_args=DEFAULT_ARGS,
+    description="Google Play T-1 günlük estimated sales BigQuery yüklemesi",
+    start_date=datetime(2026, 6, 1),
+    schedule="30 18 * * *",
+    catchup=False,
+    max_active_runs=1,
+    is_paused_upon_creation=True,
+    tags=["google_play", "finance", "daily", "bigquery"],
+) as google_play_sales_daily:
+    run_export = PythonOperator(
+        task_id="run_google_play_sales_daily",
+        python_callable=run_google_play_daily,
+        on_success_callback=notify_success,
+        on_failure_callback=notify_failure,
+    )

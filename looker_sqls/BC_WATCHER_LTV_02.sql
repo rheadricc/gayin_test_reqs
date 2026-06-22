@@ -8,7 +8,8 @@
 --   - Light = bottom 30%
 --   - Heavy = top 30%
 --   - Middle excluded
---   - daily watch outliers above 24h are excluded from segmentation
+--   - users with any daily watch above 24h in the first 30 days are excluded from segmentation
+--   - users with less than 1 minute total watch time in the first 30 days are excluded from segmentation
 --   - LTV uses TRY + foreign currency realized lifetime value
 --   - Foreign currencies converted to TRY with TCMB forex_buying rate
 --   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
@@ -119,17 +120,26 @@ first_30d_user_day_watch AS (
 first_30d_watch_time AS (
   SELECT
     user_id,
-    SUM(daily_watch_minutes) AS watch_minutes_30d
+    SUM(daily_watch_minutes) AS watch_minutes_30d,
+    MAX(CASE WHEN daily_watch_minutes > 1440 THEN 1 ELSE 0 END) AS has_daily_watch_over_24h
   FROM first_30d_user_day_watch
-  WHERE daily_watch_minutes <= 1440
   GROUP BY user_id
+),
+
+eligible_watcher_users AS (
+  SELECT
+    user_id,
+    watch_minutes_30d
+  FROM first_30d_watch_time
+  WHERE watch_minutes_30d >= 1
+    AND has_daily_watch_over_24h = 0
 ),
 
 percentile_bounds AS (
   SELECT
     APPROX_QUANTILES(watch_minutes_30d, 100)[OFFSET(30)] AS p30_watch_minutes,
     APPROX_QUANTILES(watch_minutes_30d, 100)[OFFSET(70)] AS p70_watch_minutes
-  FROM first_30d_watch_time
+  FROM eligible_watcher_users
 ),
 
 watcher_segment AS (
@@ -141,7 +151,7 @@ watcher_segment AS (
       WHEN w.watch_minutes_30d >= b.p70_watch_minutes THEN 'Heavy'
       ELSE 'Middle'
     END AS watcher_type
-  FROM first_30d_watch_time w
+  FROM eligible_watcher_users w
   CROSS JOIN percentile_bounds b
 ),
 

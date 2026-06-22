@@ -15,11 +15,11 @@ WITH params AS (
 ),
 
 payment_option_config AS (
-  SELECT 'APP_STORE'       AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'PLAY_STORE'      AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'MOBILE_PAYMENT'  AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'CRAFTGATE'       AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+  SELECT 'APP_STORE'       AS payment_option, 0.30 AS commission_rate UNION ALL
+  SELECT 'PLAY_STORE'      AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'MOBILE_PAYMENT'  AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'CRAFTGATE'       AS payment_option, 0.00 AS commission_rate UNION ALL
+  SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate
 ),
 
 tcmb_rates AS (
@@ -148,7 +148,7 @@ daily_user_revenue AS (
     a.payment_option,
     SAFE_DIVIDE(
       a.amount_gross_tl
-      * ((1.0 - COALESCE(c.commission_rate, 0.00)) * (1.0 - COALESCE(c.tax_rate, 0.20))),
+      * (1.0 - COALESCE(c.commission_rate, 0.00)),
       EXTRACT(DAY FROM LAST_DAY(a.dt))
     ) AS net_rev_tl
   FROM daily_active_dedup a
@@ -174,7 +174,7 @@ mrr_eom_daily AS (
     a.dt AS date,
     SUM(
       a.amount_gross_tl
-      * ((1.0 - COALESCE(c.commission_rate, 0.00)) * (1.0 - COALESCE(c.tax_rate, 0.20)))
+      * (1.0 - COALESCE(c.commission_rate, 0.00))
     ) AS mrr_eom_tl
   FROM daily_active_dedup a
   LEFT JOIN payment_option_config c

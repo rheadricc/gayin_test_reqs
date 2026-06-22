@@ -1,7 +1,9 @@
 import base64
 import csv
 import json
+import os
 import time
+from pathlib import Path
 from typing import List, Dict
 
 import jwt
@@ -17,12 +19,11 @@ ISSUER_ID = "203234da-b081-42db-88a4-de4b9d0fc6e1"
 KEY_ID = "W3Q4VCK3WR"
 BUNDLE_ID = "com.trgain.mikrogain"
 
-PRIVATE_KEY = """-----BEGIN PRIVATE KEY-----
-MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQgTdx/F4hUl1q1cCRC
-WUSq86nNosYKP3G26vHapX0B+8+gCgYIKoZIzj0DAQehRANCAATvXxzvE2r/Wt/r
-bZaFA7XY2qOF82stVMo95cdUggokNAWRazZRwmmY9PYQyueQPXvAB2Nz2Eexn5XU
-Uie66lgE
------END PRIVATE KEY-----"""
+PRIVATE_KEY_PATH = os.getenv(
+    "APPLE_SERVER_API_PRIVATE_KEY_PATH",
+    "/Users/batuhancakir/Downloads/"
+    "SubscriptionKey_W3Q4VCK3WR_inn-app_purchase_token.p8",
+)
 
 CSV_FILE = "apple_ids.csv"
 
@@ -37,10 +38,20 @@ MAX_TEST_IDS = 0  # 0 = hepsini işle, 5 = ilk 5 ID gibi
 # KEY VALIDATION
 # =========================
 
+def load_private_key():
+    private_key_path = Path(PRIVATE_KEY_PATH)
+    if not private_key_path.is_file():
+        raise FileNotFoundError(
+            "Apple Server API private key bulunamadı: "
+            f"{private_key_path}. APPLE_SERVER_API_PRIVATE_KEY_PATH ayarlanmalı."
+        )
+    return private_key_path.read_text()
+
+
 def validate_private_key():
     try:
         serialization.load_pem_private_key(
-            PRIVATE_KEY.encode("utf-8"),
+            load_private_key().encode("utf-8"),
             password=None,
         )
         print("[KEY] PEM format OK")
@@ -71,7 +82,7 @@ def generate_jwt():
 
     return jwt.encode(
         payload,
-        PRIVATE_KEY,
+        load_private_key(),
         algorithm="ES256",
         headers=headers,
     )
