@@ -10,6 +10,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
+from slack_callbacks import notify_failure, notify_success
 
 
 DAG_ID = "gain_kids_profile_full_scan"
@@ -104,4 +105,6 @@ with DAG(
         task_id="run_kids_profile_scan",
         python_callable=run_kids_profile_scan_callable,
         provide_context=True,
+        on_success_callback=notify_success,
+        on_failure_callback=notify_failure,
     )

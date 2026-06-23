@@ -9,8 +9,8 @@ from airflow import DAG
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
 from google.cloud import bigquery
+from slack_callbacks import notify_failure, notify_success
 
 
 S3_BUCKET = "gain-data-airflow-bucket"
@@ -22,49 +22,6 @@ DEFAULT_ARGS = {
     "retries": 3,
     "retry_delay": timedelta(hours=1),
 }
-
-
-def send_slack_notification(context, success):
-    task_instance = context["task_instance"]
-    duration = task_instance.duration
-    duration_text = f"{duration:.1f}s" if duration is not None else "n/a"
-    log_url = task_instance.log_url
-
-    if success:
-        result = task_instance.xcom_pull(
-            task_ids=task_instance.task_id,
-            key="return_value",
-        ) or {}
-        text = (
-            ":white_check_mark: *Apple finance load succeeded*\n"
-            f"*Target date:* {result.get('target_date', 'n/a')}\n"
-            f"*Loaded rows:* {result.get('row_count', 'n/a')}\n"
-            f"*BigQuery table:* `{result.get('table_id', 'n/a')}`\n"
-            f"*Duration:* {duration_text}\n"
-            f"<{log_url}|Open Airflow log>"
-        )
-    else:
-        exception = context.get("exception")
-        exception_text = str(exception)[:1000] if exception else "Unknown error"
-        text = (
-            "<!channel>\n"
-            ":red_circle: *Apple finance load failed*\n"
-            f"*Target:* T-1\n"
-            f"*Task:* `{task_instance.task_id}`\n"
-            f"*Final try:* {task_instance.try_number}\n"
-            f"*Error:* `{exception_text}`\n"
-            f"<{log_url}|Open Airflow log>"
-        )
-
-    SlackWebhookHook(slack_webhook_conn_id="slack_default").send(text=text)
-
-
-def notify_success(context):
-    send_slack_notification(context, success=True)
-
-
-def notify_failure(context):
-    send_slack_notification(context, success=False)
 
 
 def download_and_import_script(bucket_name, s3_key, module_name):

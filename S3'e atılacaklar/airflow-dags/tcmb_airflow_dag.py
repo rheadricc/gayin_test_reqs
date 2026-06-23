@@ -10,6 +10,7 @@ from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
+from slack_callbacks import notify_failure, notify_success
 
 
 S3_BUCKET = "gain-data-airflow-bucket"
@@ -112,4 +113,6 @@ with DAG(
         task_id="run_tcmb_exchange_rates_daily",
         python_callable=run_tcmb_exchange_rates,
         op_kwargs={"mode": "daily"},
+        on_success_callback=notify_success,
+        on_failure_callback=notify_failure,
     )

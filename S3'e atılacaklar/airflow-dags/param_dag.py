@@ -10,6 +10,7 @@ from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
+from slack_callbacks import notify_failure, notify_success
 
 
 S3_BUCKET = "gain-data-airflow-bucket"
@@ -110,6 +111,8 @@ def create_param_dag(dag_id, mode, schedule, description):
             task_id=f"run_param_transactions_{mode}",
             python_callable=run_param_transactions,
             op_kwargs={"mode": mode},
+            on_success_callback=notify_success,
+            on_failure_callback=notify_failure,
         )
 
         return dag

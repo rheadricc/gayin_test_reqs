@@ -10,6 +10,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from google.cloud import bigquery
+from slack_callbacks import notify_failure, notify_success
 
 
 DAG_ID = "gain_profile_counter"
@@ -115,4 +116,6 @@ with DAG(
     run_multi_profile_counter = PythonOperator(
         task_id="run_multi_profile_counter",
         python_callable=run_multi_profile_counter_callable,
+        on_success_callback=notify_success,
+        on_failure_callback=notify_failure,
     )
