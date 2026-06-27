@@ -4,24 +4,37 @@
 -- Granularity:
 --   1 row per user per lifetime month
 --
---   - blended monthly CAC = ads_daily_spend monthly total spend / monthly acquired users
+-- Revenue:
+--   - realized cash revenue is counted once, in the payment month
+--   - subscription validity is used only for active/retention calculations
+--
+-- CAC:
+--   - blended monthly CAC = ads_daily_spend monthly total spend / all monthly
+--     acquired paid users
+--   - ad spend cannot be attributed reliably to NORMAL vs CAMPAIGN with the
+--     available source fields; CAC is therefore a blended acquisition metric
 --
 -- Notes:
---   - CAC is blended monthly CAC, same for NORMAL and CAMPAIGN within same cohort_month
---   - churn can be derived in Looker as 1 - AVG(active_flag)
+--   - use cohort_type_key = normal/campaign in Looker filters
+--   - use *_anchor fields for scorecards to avoid user-month reweighting
+--   - cumulative_inactive_flag is cumulative loss; churn_event_flag /
+--     churn_risk_flag produce true month-over-month churn
 
 WITH params AS (
   SELECT
     PARSE_DATE('%Y%m%d', @DS_START_DATE) AS ds_start,
-    PARSE_DATE('%Y%m%d', @DS_END_DATE)   AS ds_end
+    LEAST(
+      PARSE_DATE('%Y%m%d', @DS_END_DATE),
+      DATE_SUB(CURRENT_DATE('Europe/Istanbul'), INTERVAL 1 DAY)
+    ) AS ds_end
 ),
 
 payment_option_config AS (
-  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate UNION ALL
+  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate UNION ALL
+  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate
 ),
 
 tcmb_rates AS (
@@ -48,17 +61,16 @@ subs_base AS (
     s.inserted_date,
     DATE(s.created_at) AS created_date,
     DATE(s.valid_until) AS valid_until_date,
+    s.apple_original_transaction_id,
+    s.google_original_transaction_id,
     DATE(s.grace_until) AS grace_until_date,
     DATE(s.hold_until) AS hold_until_date,
     DATE(s.free_trial_start_date) AS free_trial_start_date,
     DATE(s.free_trial_end_date) AS free_trial_end_date,
 
-    CASE
-      WHEN s.status = 'ON_HOLD'  THEN COALESCE(DATE(s.hold_until),  DATE(s.valid_until))
-      WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
-      ELSE DATE(s.valid_until)
-    END AS active_end_date,
+    DATE(s.valid_until) AS paid_end_date,
 
+    CAST(COALESCE(s.amount, 0) AS INT64) AS actual_amount_minor,
     SAFE_DIVIDE(CAST(COALESCE(s.amount, 0) AS FLOAT64), 100.0) AS actual_amount_original,
     SAFE_DIVIDE(CAST(COALESCE(s.amount_before_promotions, s.amount, 0) AS FLOAT64), 100.0) AS before_promo_amount_original,
 
@@ -118,9 +130,27 @@ subs_converted AS (
      OR rate_rn = 1
 ),
 
+/* Keep the latest warehouse snapshot of the same payment event. */
+subs_transactions AS (
+  SELECT *
+  FROM subs_converted
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY
+      CAST(user_id AS STRING),
+      created_at,
+      valid_until_date,
+      UPPER(TRIM(payment_option)),
+      currency_code,
+      apple_original_transaction_id,
+      google_original_transaction_id,
+      actual_amount_minor
+    ORDER BY inserted_date DESC
+  ) = 1
+),
+
 /* =====================================================
    2) FIRST REAL PAID EVENT
-   - first row where actual amount > 0
+   - first row where raw actual amount is > 101 minor units
    ===================================================== */
 first_paid_raw AS (
   SELECT
@@ -133,8 +163,9 @@ first_paid_raw AS (
       PARTITION BY s.user_id
       ORDER BY s.created_at ASC, s.inserted_date ASC
     ) AS rn
-  FROM subs_converted s
-  WHERE s.actual_amount_gross_tl > 0
+  FROM subs_transactions s
+  WHERE s.actual_amount_minor > 101
+    AND s.actual_amount_gross_tl IS NOT NULL
 ),
 
 first_paid AS (
@@ -166,25 +197,33 @@ cohort_users AS (
    4) PROMOTION ATTRIBUTION
    - any promo attached on/before first paid date
    ===================================================== */
-promo_before_first_paid AS (
+promo_before_first_paid_raw AS (
   SELECT
     cu.user_id,
-    ap.promotionId AS promotion_id,
-    ap.name AS applied_promo_name,
-    ap.type AS applied_promo_type,
-    ap.isActive AS applied_promo_is_active,
+    CAST(ap.promotionId AS STRING) AS promotion_id,
+    ARRAY_AGG(ap.name IGNORE NULLS ORDER BY ap.applyDate DESC LIMIT 1)[SAFE_OFFSET(0)] AS applied_promo_name,
+    ARRAY_AGG(ap.type IGNORE NULLS ORDER BY ap.applyDate DESC LIMIT 1)[SAFE_OFFSET(0)] AS applied_promo_type,
+    ARRAY_AGG(ap.isActive IGNORE NULLS ORDER BY ap.applyDate DESC LIMIT 1)[SAFE_OFFSET(0)] AS applied_promo_is_active,
     DATE(ap.applyDate) AS promo_apply_date,
-    DATE(ap.leaveDate) AS promo_leave_date,
-    ROW_NUMBER() OVER (
-      PARTITION BY cu.user_id
-      ORDER BY COALESCE(ap.applyDate, sb.created_at) ASC, sb.created_at ASC
-    ) AS rn
+    MAX(DATE(ap.leaveDate)) AS promo_leave_date
   FROM cohort_users cu
-  JOIN subs_converted sb
+  JOIN subs_transactions sb
     ON cu.user_id = sb.user_id
-   AND sb.created_date <= cu.first_paid_date
+   AND sb.created_at <= cu.first_paid_at
   CROSS JOIN UNNEST(sb.applied_promotions) ap
   WHERE ap.promotionId IS NOT NULL
+    AND COALESCE(DATE(ap.applyDate), sb.created_date) <= cu.first_paid_date
+  GROUP BY cu.user_id, promotion_id, promo_apply_date
+),
+
+promo_before_first_paid AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY user_id
+      ORDER BY promo_apply_date DESC, promotion_id
+    ) AS rn
+  FROM promo_before_first_paid_raw
 ),
 
 acquisition_promo AS (
@@ -245,7 +284,7 @@ cohort_labeled AS (
 ),
 
 /* =====================================================
-   6) DAILY ACTIVE REVENUE AFTER FIRST PAID DATE
+   6) DAILY PAID ACTIVITY AFTER FIRST PAID DATE
    ===================================================== */
 daily_active_raw AS (
   SELECT
@@ -261,35 +300,21 @@ daily_active_raw AS (
     cl.first_paid_payment_option,
     cl.campaign_end_date,
 
-    sb.payment_option,
     sb.created_at,
-    sb.inserted_date,
-
-    SAFE_DIVIDE(
-      sb.actual_amount_gross_tl
-      * ((1.0 - COALESCE(cfg.commission_rate, 0.00)) * (1.0 - COALESCE(cfg.tax_rate, 0.20))),
-      EXTRACT(DAY FROM LAST_DAY(d))
-    ) AS actual_net_rev_tl_day,
-
-    SAFE_DIVIDE(
-      sb.before_promo_amount_gross_tl
-      * ((1.0 - COALESCE(cfg.commission_rate, 0.00)) * (1.0 - COALESCE(cfg.tax_rate, 0.20))),
-      EXTRACT(DAY FROM LAST_DAY(d))
-    ) AS gross_net_rev_before_promo_tl_day
-  FROM subs_converted sb
+    sb.inserted_date
+  FROM subs_transactions sb
   JOIN cohort_labeled cl
     ON sb.user_id = cl.user_id
+   AND sb.actual_amount_minor > 101
    AND sb.actual_amount_gross_tl IS NOT NULL
-  LEFT JOIN payment_option_config cfg
-    ON sb.payment_option = cfg.payment_option
   CROSS JOIN params p
   CROSS JOIN UNNEST(
     GENERATE_DATE_ARRAY(
       GREATEST(sb.created_date, cl.first_paid_date),
-      LEAST(COALESCE(sb.active_end_date, sb.created_date), p.ds_end)
+      LEAST(COALESCE(sb.paid_end_date, sb.created_date), p.ds_end)
     )
   ) AS d
-  WHERE COALESCE(sb.active_end_date, sb.created_date) >= cl.first_paid_date
+  WHERE COALESCE(sb.paid_end_date, sb.created_date) >= cl.first_paid_date
 ),
 
 daily_active_dedup AS (
@@ -305,9 +330,7 @@ daily_active_dedup AS (
     cohort_month,
     first_paid_payment_option,
     campaign_end_date,
-    payment_option,
-    actual_net_rev_tl_day,
-    gross_net_rev_before_promo_tl_day
+    1 AS active_flag
   FROM (
     SELECT
       r.*,
@@ -321,7 +344,7 @@ daily_active_dedup AS (
 ),
 
 /* =====================================================
-   7) USER-MONTH ACTIVITY / REVENUE
+   7) USER-MONTH ACTIVITY + REALIZED PAYMENT REVENUE
    ===================================================== */
 user_month_activity AS (
   SELECT
@@ -337,10 +360,18 @@ user_month_activity AS (
     campaign_end_date,
     DATE_TRUNC(dt, MONTH) AS activity_month,
     DATE_DIFF(DATE_TRUNC(dt, MONTH), cohort_month, MONTH) AS lifetime_month,
-    1 AS active_flag,
-    SUM(actual_net_rev_tl_day) AS actual_net_revenue_tl,
-    SUM(gross_net_rev_before_promo_tl_day) AS gross_net_revenue_before_promo_tl
+    MAX(
+      IF(
+        dt = LEAST(
+          LAST_DAY(dt),
+          p.ds_end
+        ),
+        1,
+        0
+      )
+    ) AS active_flag
   FROM daily_active_dedup
+  CROSS JOIN params p
   GROUP BY
     user_id,
     cohort_type,
@@ -354,6 +385,31 @@ user_month_activity AS (
     campaign_end_date,
     activity_month,
     lifetime_month
+),
+
+transaction_revenue AS (
+  SELECT
+    sb.user_id,
+    DATE_TRUNC(sb.created_date, MONTH) AS activity_month,
+    SUM(
+      sb.actual_amount_gross_tl
+        * (1.0 - COALESCE(cfg.commission_rate, 0.00))
+    ) AS actual_net_revenue_tl,
+    SUM(
+      sb.before_promo_amount_gross_tl
+        * (1.0 - COALESCE(cfg.commission_rate, 0.00))
+    ) AS gross_net_revenue_before_promo_tl
+  FROM subs_transactions sb
+  JOIN cohort_labeled cl
+    ON sb.user_id = cl.user_id
+   AND sb.created_at >= cl.first_paid_at
+  CROSS JOIN params p
+  LEFT JOIN payment_option_config cfg
+    ON UPPER(TRIM(sb.payment_option)) = cfg.payment_option
+  WHERE sb.actual_amount_minor > 101
+    AND sb.actual_amount_gross_tl IS NOT NULL
+    AND sb.created_date <= p.ds_end
+  GROUP BY sb.user_id, activity_month
 ),
 
 /* =====================================================
@@ -400,12 +456,15 @@ user_month_final AS (
     s.lifetime_month,
 
     COALESCE(a.active_flag, 0) AS active_flag,
-    COALESCE(a.actual_net_revenue_tl, 0) AS actual_net_revenue_tl,
-    COALESCE(a.gross_net_revenue_before_promo_tl, 0) AS gross_net_revenue_before_promo_tl
+    COALESCE(r.actual_net_revenue_tl, 0) AS actual_net_revenue_tl,
+    COALESCE(r.gross_net_revenue_before_promo_tl, 0) AS gross_net_revenue_before_promo_tl
   FROM user_month_spine s
   LEFT JOIN user_month_activity a
     ON s.user_id = a.user_id
    AND s.activity_month = a.activity_month
+  LEFT JOIN transaction_revenue r
+    ON s.user_id = r.user_id
+   AND s.activity_month = r.activity_month
 ),
 
 /* =====================================================
@@ -482,11 +541,54 @@ final_joined AS (
   FROM final_with_ltv l
   LEFT JOIN monthly_cac c
     ON l.cohort_month = c.cohort_month
+),
+
+final_with_helper_fields AS (
+  SELECT
+    f.*,
+    LOWER(f.cohort_type) AS cohort_type_key,
+    IF(f.lifetime_month = 0, f.cac_tl, NULL) AS cac_user_anchor_tl,
+    IF(
+      f.activity_month = DATE_TRUNC(p.ds_end, MONTH),
+      f.cum_actual_ltv_tl,
+      NULL
+    ) AS terminal_realized_ltv_anchor_tl,
+    IF(
+      f.activity_month = DATE_TRUNC(p.ds_end, MONTH),
+      SAFE_DIVIDE(f.cum_actual_ltv_tl, f.cac_tl),
+      NULL
+    ) AS terminal_user_ltv_cac_anchor,
+    LAST_DAY(f.cohort_month) <= p.ds_end AS is_completed_cohort_month,
+    LAST_DAY(f.activity_month) <= p.ds_end AS is_completed_activity_month,
+    CASE
+      WHEN f.total_spend_tl IS NULL THEN 'missing_spend'
+      WHEN f.acquired_users IS NULL OR f.acquired_users = 0 THEN 'missing_acquired_users'
+      ELSE 'ok'
+    END AS cac_status,
+    1 - f.active_flag AS cumulative_inactive_flag,
+    LAG(f.active_flag) OVER (
+      PARTITION BY f.user_id
+      ORDER BY f.activity_month
+    ) AS previous_active_flag
+  FROM final_joined f
+  CROSS JOIN params p
+),
+
+final_output AS (
+  SELECT
+    f.*,
+    IF(f.previous_active_flag = 1, 1, 0) AS churn_risk_flag,
+    IF(f.previous_active_flag = 1 AND f.active_flag = 0, 1, 0) AS churn_event_flag,
+    MIN(
+      IF(f.cum_actual_ltv_tl >= f.cac_tl, f.lifetime_month, NULL)
+    ) OVER (PARTITION BY f.user_id) AS realized_payback_lifetime_month
+  FROM final_with_helper_fields f
 )
 
 SELECT
   user_id,
   cohort_type,
+  cohort_type_key,
   promotion_id,
   promotion_name,
   promotion_type,
@@ -502,6 +604,10 @@ SELECT
   activity_month,
   lifetime_month,
   active_flag,
+  cumulative_inactive_flag,
+  previous_active_flag,
+  churn_risk_flag,
+  churn_event_flag,
 
   actual_net_revenue_tl,
   gross_net_revenue_before_promo_tl,
@@ -512,8 +618,15 @@ SELECT
   total_spend_tl,
   acquired_users,
   cac_tl,
+  cac_user_anchor_tl,
 
   ltv_cac_ratio_actual,
-  ltv_cac_ratio_gross_before_promo
-FROM final_joined
+  ltv_cac_ratio_gross_before_promo,
+  terminal_realized_ltv_anchor_tl,
+  terminal_user_ltv_cac_anchor,
+  is_completed_cohort_month,
+  is_completed_activity_month,
+  cac_status,
+  realized_payback_lifetime_month
+FROM final_output
 ORDER BY cohort_month, cohort_type, promotion_name, user_id, lifetime_month;

@@ -45,11 +45,7 @@ subs_base AS (
     DATE(s.valid_until)  AS valid_until_date,
     DATE(s.grace_until)  AS grace_until_date,
     DATE(s.hold_until)   AS hold_until_date,
-    CASE
-      WHEN s.status = 'ON_HOLD'  THEN COALESCE(DATE(s.hold_until),  DATE(s.valid_until))
-      WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
-      ELSE DATE(s.valid_until)
-    END AS active_end_date,
+    DATE(s.valid_until) AS paid_end_date,
     UPPER(s.currency) AS currency_code,
     SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
@@ -57,7 +53,8 @@ subs_base AS (
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
-    AND s.status IN ('ACTIVE','CANCELED', 'IN_GRACE', 'ON_HOLD')
+    AND s.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD', 'EXPIRED')
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
     AND DATE(s.created_at) <= p.ds_end
 ),
 
@@ -100,7 +97,7 @@ subs AS (
   SELECT *
   FROM subs_converted
   CROSS JOIN params p
-  WHERE active_end_date >= p.ds_start
+  WHERE paid_end_date >= p.ds_start
     AND amount_gross_tl IS NOT NULL
 ),
 
@@ -120,7 +117,7 @@ daily_active_raw AS (
     s.inserted_date
   FROM days d
   JOIN subs s
-    ON d.dt BETWEEN s.created_date AND s.active_end_date
+    ON d.dt BETWEEN s.created_date AND s.paid_end_date
 ),
 
 daily_active_dedup AS (
@@ -160,7 +157,7 @@ monthly_kpis AS (
   SELECT
     DATE_TRUNC(r.dt, MONTH) AS month,
     r.payment_option,
-    COUNT(DISTINCT r.user_id) AS active_subscribers,
+    COUNT(DISTINCT r.user_id) AS paid_subscribers,
     SUM(r.net_rev_tl) AS net_revenue_tl,
     SAFE_DIVIDE(SUM(r.net_rev_tl), COUNT(DISTINCT r.user_id)) AS arpu_tl
   FROM daily_user_revenue r
@@ -185,7 +182,8 @@ mrr_eom_monthly AS (
 SELECT
   k.month,
   k.payment_option,
-  k.active_subscribers,
+  k.paid_subscribers,
+  k.paid_subscribers AS active_subscribers,
   k.net_revenue_tl,
   k.arpu_tl,
   ROUND(k.arpu_tl, 2) AS arpu_tl_rounded,

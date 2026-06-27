@@ -1,131 +1,119 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
--- New name: BC_FORECAST_LTV_MONTHLY_01
--- Output: MONTH grain only
--- Metric: Forecast LTV = ARPU × avg lifetime months
--- REVIEW NOTE: Forecast metric is intentionally different from realized LTV; do not compare as the same metric.
--- Logic:
---   - TRY + foreign currency payments included
---   - Foreign currencies converted to TRY with TCMB forex_buying rate
---   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
---   - PREPAID excluded
---   - CANCELED users are counted as active until valid_until
---   - avg lifetime is calculated against each month's own month-end
+-- Name: BC_FORECAST_LTV_MONTHLY_01
+-- Grain: one row per COMPLETED calendar month.
+--
+-- METRIC DICTIONARY:
+--   monthly_net_accrued_revenue_tl
+--     Subscription revenue allocated across paid-entitlement days.
+--     Payment-provider commission is deducted; tax is NOT deducted.
+--
+--   monthly_net_arpu_tl
+--     monthly_net_accrued_revenue_tl / average daily paid subscribers.
+--
+--   lost_subscribers
+--     Distinct users whose latest subscription lifecycle is IN_GRACE,
+--     ON_HOLD or EXPIRED. IN_GRACE/ON_HOLD loss date is valid_until;
+--     EXPIRED loss date is the latest of valid_until/grace_until/hold_until.
+--
+--   monthly_loss_rate
+--     lost_subscribers / paid subscribers on the first day of that month.
+--
+--   trailing_3_completed_month_loss_rate
+--     Average monthly_loss_rate of the three months BEFORE the metric month.
+--
+--   forecast_ltv_tl
+--     monthly_net_arpu_tl / trailing_3_completed_month_loss_rate.
+--     Equivalent to ARPU x expected lifetime, where expected lifetime
+--     is 1 / average monthly loss rate.
+--
+-- IMPORTANT:
+--   Partial months are intentionally excluded. A June 1-22 ARPU must not be
+--   compared with a completed May ARPU.
 
 WITH params AS (
   SELECT
     PARSE_DATE('%Y%m%d', @DS_START_DATE) AS ds_start,
-    PARSE_DATE('%Y%m%d', @DS_END_DATE)   AS ds_end
+    PARSE_DATE('%Y%m%d', @DS_END_DATE) AS ds_end,
+    DATE_TRUNC(PARSE_DATE('%Y%m%d', @DS_START_DATE), MONTH) AS output_start_month,
+    CASE
+      WHEN PARSE_DATE('%Y%m%d', @DS_END_DATE)
+        = LAST_DAY(PARSE_DATE('%Y%m%d', @DS_END_DATE))
+      THEN DATE_TRUNC(PARSE_DATE('%Y%m%d', @DS_END_DATE), MONTH)
+      ELSE DATE_TRUNC(
+        DATE_SUB(PARSE_DATE('%Y%m%d', @DS_END_DATE), INTERVAL 1 MONTH),
+        MONTH
+      )
+    END AS output_end_month
+),
+
+bounds AS (
+  SELECT
+    *,
+    DATE_SUB(output_start_month, INTERVAL 3 MONTH) AS history_start_month,
+    LAST_DAY(output_end_month) AS history_end_date
+  FROM params
 ),
 
 payment_option_config AS (
-  SELECT 'APP_STORE'       AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'PLAY_STORE'      AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'MOBILE_PAYMENT'  AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'CRAFTGATE'       AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate UNION ALL
+  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate UNION ALL
+  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate
 ),
 
 tcmb_rates AS (
   SELECT
     DATE(rate_date) AS rate_date,
     UPPER(currency_code) AS currency_code,
-    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+    SAFE_DIVIDE(
+      CAST(forex_buying AS FLOAT64),
+      NULLIF(CAST(unit AS FLOAT64), 0.0)
+    ) AS rate_to_try
   FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
   WHERE currency_code IS NOT NULL
     AND forex_buying IS NOT NULL
     AND unit IS NOT NULL
 ),
 
-paid_payment_base AS (
+subs_base AS (
   SELECT
     CAST(s.user_id AS STRING) AS user_id,
-    DATE(s.created_at) AS payment_date,
+    UPPER(TRIM(s.status)) AS status,
+    UPPER(TRIM(s.payment_option)) AS payment_option,
+    s.created_at,
+    s.inserted_date,
+    DATE(s.created_at) AS created_date,
+    DATE(s.valid_until) AS valid_until_date,
+    DATE(s.grace_until) AS grace_until_date,
+    DATE(s.hold_until) AS hold_until_date,
+    DATE(s.valid_until) AS paid_end_date,
+    CASE
+      WHEN UPPER(TRIM(s.status)) IN ('IN_GRACE', 'ON_HOLD')
+        THEN DATE(s.valid_until)
+      WHEN UPPER(TRIM(s.status)) = 'EXPIRED'
+        THEN GREATEST(
+          DATE(s.valid_until),
+          COALESCE(DATE(s.grace_until), DATE(s.valid_until)),
+          COALESCE(DATE(s.hold_until), DATE(s.valid_until))
+        )
+      ELSE NULL
+    END AS loss_date,
     UPPER(TRIM(s.currency)) AS currency_code,
-    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
+    SAFE_DIVIDE(
+      CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64),
+      100.0
+    ) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
-  CROSS JOIN params p
+  CROSS JOIN bounds b
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND UPPER(TRIM(s.payment_option)) != 'PREPAID'
-    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 0
-    AND DATE(s.created_at) <= p.ds_end
-),
-
-paid_payment_rate_candidates AS (
-  SELECT
-    p.*,
-    r.rate_date AS matched_rate_date,
-    r.rate_to_try,
-    ROW_NUMBER() OVER (
-      PARTITION BY
-        p.user_id,
-        p.payment_date,
-        p.currency_code,
-        CAST(p.amount_original AS STRING)
-      ORDER BY r.rate_date DESC
-    ) AS rate_rn
-  FROM paid_payment_base p
-  LEFT JOIN tcmb_rates r
-    ON p.currency_code != 'TRY'
-   AND r.currency_code = p.currency_code
-   AND r.rate_date <= p.payment_date
-),
-
-paid_payments AS (
-  SELECT
-    user_id,
-    payment_date,
-    currency_code,
-    amount_original,
-    matched_rate_date,
-    rate_to_try
-  FROM paid_payment_rate_candidates
-  WHERE currency_code = 'TRY'
-     OR rate_rn = 1
-),
-
-sub_start AS (
-  SELECT
-    user_id,
-    MIN(payment_date) AS first_sub_date
-  FROM paid_payments
-  WHERE currency_code = 'TRY'
-     OR rate_to_try IS NOT NULL
-  GROUP BY user_id
-),
-
-subs_base AS (
-  SELECT
-    s.user_id,
-    s.status,
-    s.payment_option,
-    s.created_at,
-    s.inserted_date,
-    DATE(s.created_at)  AS created_date,
-    DATE(s.valid_until) AS valid_until_date,
-    DATE(s.grace_until) AS grace_until_date,
-    DATE(s.hold_until)  AS hold_until_date,
-    CASE
-      WHEN s.status = 'ON_HOLD'  THEN COALESCE(DATE(s.hold_until),  DATE(s.valid_until))
-      WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
-      ELSE DATE(s.valid_until)
-    END AS active_end_date,
-    UPPER(TRIM(s.currency)) AS currency_code,
-    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
-  FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
-  CROSS JOIN params p
-  WHERE s.user_id IS NOT NULL
-    AND s.payment_option IS NOT NULL
-    AND s.payment_option != 'PREPAID'
-    AND s.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD')
-    AND DATE(s.created_at) <= p.ds_end
-),
-
-subs AS (
-  SELECT *
-  FROM subs_base
-  CROSS JOIN params p
-  WHERE active_end_date >= p.ds_start
+    AND UPPER(TRIM(s.status)) IN (
+      'ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD', 'EXPIRED'
+    )
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
+    AND DATE(s.created_at) <= b.history_end_date
 ),
 
 subs_with_rate_candidates AS (
@@ -135,7 +123,7 @@ subs_with_rate_candidates AS (
     r.rate_to_try,
     ROW_NUMBER() OVER (
       PARTITION BY
-        CAST(s.user_id AS STRING),
+        s.user_id,
         s.payment_option,
         s.currency_code,
         s.created_at,
@@ -144,7 +132,7 @@ subs_with_rate_candidates AS (
         CAST(s.amount_original AS STRING)
       ORDER BY r.rate_date DESC
     ) AS rate_rn
-  FROM subs s
+  FROM subs_base s
   LEFT JOIN tcmb_rates r
     ON s.currency_code != 'TRY'
    AND r.currency_code = s.currency_code
@@ -163,110 +151,152 @@ subs_converted AS (
      OR rate_rn = 1
 ),
 
-days AS (
-  SELECT d AS dt
-  FROM params p,
-  UNNEST(GENERATE_DATE_ARRAY(p.ds_start, p.ds_end)) AS d
+calendar_days AS (
+  SELECT d AS date
+  FROM bounds b,
+  UNNEST(GENERATE_DATE_ARRAY(b.history_start_month, b.history_end_date)) AS d
 ),
 
-daily_active_raw AS (
+daily_paid_raw AS (
   SELECT
-    d.dt,
+    d.date,
     s.user_id,
     s.payment_option,
     s.amount_gross_tl,
     s.created_at,
     s.inserted_date
-  FROM days d
+  FROM calendar_days d
   JOIN subs_converted s
-    ON d.dt BETWEEN s.created_date AND s.active_end_date
+    ON d.date BETWEEN s.created_date AND s.paid_end_date
    AND s.amount_gross_tl IS NOT NULL
 ),
 
-daily_active_dedup AS (
+daily_paid_dedup AS (
   SELECT
-    r.dt,
-    r.user_id,
-    r.payment_option,
-    r.amount_gross_tl
+    date,
+    user_id,
+    payment_option,
+    amount_gross_tl
   FROM (
     SELECT
       r.*,
       ROW_NUMBER() OVER (
-        PARTITION BY r.dt, r.user_id
+        PARTITION BY r.date, r.user_id
         ORDER BY r.created_at DESC, r.inserted_date DESC
       ) AS rn
-    FROM daily_active_raw r
-  ) r
-  WHERE r.rn = 1
+    FROM daily_paid_raw r
+  )
+  WHERE rn = 1
 ),
 
-daily_user_revenue AS (
+daily_metrics AS (
   SELECT
-    a.dt,
-    a.user_id,
-    SAFE_DIVIDE(
-      a.amount_gross_tl
-      * ((1.0 - COALESCE(c.commission_rate, 0.00)) * (1.0 - COALESCE(c.tax_rate, 0.20))),
-      EXTRACT(DAY FROM LAST_DAY(a.dt))
-    ) AS net_rev_tl
-  FROM daily_active_dedup a
+    d.date,
+    DATE_TRUNC(d.date, MONTH) AS month,
+    COUNT(DISTINCT d.user_id) AS paid_subscribers,
+    SUM(
+      SAFE_DIVIDE(
+        d.amount_gross_tl
+          * (1.0 - COALESCE(c.commission_rate, 0.00)),
+        EXTRACT(DAY FROM LAST_DAY(d.date))
+      )
+    ) AS net_accrued_revenue_tl
+  FROM daily_paid_dedup d
   LEFT JOIN payment_option_config c
-    ON a.payment_option = c.payment_option
+    ON d.payment_option = c.payment_option
+  GROUP BY d.date, month
 ),
 
-daily_kpis AS (
-  SELECT
-    DATE_TRUNC(dt, MONTH) AS month,
-    dt,
-    COUNT(DISTINCT user_id) AS daily_active_users,
-    SUM(net_rev_tl) AS daily_revenue_tl
-  FROM daily_user_revenue
-  GROUP BY month, dt
-),
-
-monthly_totals AS (
+monthly_paid_metrics AS (
   SELECT
     month,
-    SUM(daily_revenue_tl) AS total_revenue_tl,
-    AVG(daily_active_users) AS avg_daily_active_users
-  FROM daily_kpis
+    SUM(net_accrued_revenue_tl) AS monthly_net_accrued_revenue_tl,
+    AVG(paid_subscribers) AS avg_daily_paid_subscribers,
+    MAX(IF(date = month, paid_subscribers, NULL)) AS month_start_paid_subscribers
+  FROM daily_metrics
   GROUP BY month
 ),
 
-monthly_active_users AS (
-  SELECT DISTINCT
-    DATE_TRUNC(dt, MONTH) AS month,
-    user_id
-  FROM daily_active_dedup
+loss_events AS (
+  SELECT
+    DATE_TRUNC(loss_date, MONTH) AS month,
+    COUNT(DISTINCT user_id) AS lost_subscribers
+  FROM subs_converted
+  CROSS JOIN bounds b
+  WHERE status IN ('IN_GRACE', 'ON_HOLD', 'EXPIRED')
+    AND loss_date BETWEEN b.history_start_month AND b.history_end_date
+  GROUP BY month
 ),
 
-monthly_age AS (
+month_spine AS (
+  SELECT month
+  FROM bounds b,
+  UNNEST(
+    GENERATE_DATE_ARRAY(
+      b.history_start_month,
+      b.output_end_month,
+      INTERVAL 1 MONTH
+    )
+  ) AS month
+),
+
+monthly_metrics AS (
   SELECT
-    mau.month,
-    AVG(
-      SAFE_DIVIDE(
-        DATE_DIFF(LAST_DAY(mau.month), ss.first_sub_date, DAY),
-        30.0
-      )
-    ) AS avg_lifetime_months
-  FROM monthly_active_users mau
-  JOIN sub_start ss
-    ON mau.user_id = ss.user_id
-  GROUP BY mau.month
+    m.month,
+    COALESCE(p.monthly_net_accrued_revenue_tl, 0) AS monthly_net_accrued_revenue_tl,
+    COALESCE(p.avg_daily_paid_subscribers, 0) AS avg_daily_paid_subscribers,
+    COALESCE(p.month_start_paid_subscribers, 0) AS month_start_paid_subscribers,
+    COALESCE(l.lost_subscribers, 0) AS lost_subscribers,
+    SAFE_DIVIDE(
+      COALESCE(l.lost_subscribers, 0),
+      NULLIF(p.month_start_paid_subscribers, 0)
+    ) AS monthly_loss_rate,
+    SAFE_DIVIDE(
+      p.monthly_net_accrued_revenue_tl,
+      NULLIF(p.avg_daily_paid_subscribers, 0)
+    ) AS monthly_net_arpu_tl
+  FROM month_spine m
+  LEFT JOIN monthly_paid_metrics p
+    ON m.month = p.month
+  LEFT JOIN loss_events l
+    ON m.month = l.month
+),
+
+with_trailing_loss AS (
+  SELECT
+    *,
+    AVG(monthly_loss_rate) OVER (
+      ORDER BY month
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ) AS trailing_3_completed_month_loss_rate,
+    COUNT(monthly_loss_rate) OVER (
+      ORDER BY month
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ) AS loss_rate_month_count
+  FROM monthly_metrics
 )
 
 SELECT
   m.month,
-  m.total_revenue_tl,
-  m.avg_daily_active_users,
-  SAFE_DIVIDE(m.total_revenue_tl, m.avg_daily_active_users) AS arpu_tl,
-  a.avg_lifetime_months,
-  SAFE_MULTIPLY(
-    SAFE_DIVIDE(m.total_revenue_tl, m.avg_daily_active_users),
-    a.avg_lifetime_months
+  LAST_DAY(m.month) AS month_end,
+  TRUE AS is_completed_month,
+  m.monthly_net_accrued_revenue_tl,
+  m.avg_daily_paid_subscribers,
+  m.month_start_paid_subscribers,
+  m.monthly_net_arpu_tl,
+  m.lost_subscribers,
+  m.monthly_loss_rate,
+  m.trailing_3_completed_month_loss_rate,
+  m.loss_rate_month_count,
+  SAFE_DIVIDE(
+    1.0,
+    m.trailing_3_completed_month_loss_rate
+  ) AS forecast_lifetime_months,
+  SAFE_DIVIDE(
+    m.monthly_net_arpu_tl,
+    m.trailing_3_completed_month_loss_rate
   ) AS forecast_ltv_tl
-FROM monthly_totals m
-LEFT JOIN monthly_age a
-  ON m.month = a.month
+FROM with_trailing_loss m
+CROSS JOIN bounds b
+WHERE m.month BETWEEN b.output_start_month AND b.output_end_month
 ORDER BY m.month;

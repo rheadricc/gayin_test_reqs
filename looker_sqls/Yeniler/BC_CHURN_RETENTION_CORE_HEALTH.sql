@@ -13,12 +13,14 @@
 -- İş kuralları:
 -- - Tek tarih alanı: date
 -- - PREPAID hariçtir.
--- - amount >= 101 gerçek ücretli abonelik kabul edilir.
+-- - amount > 101 gerçek ücretli abonelik kabul edilir.
 -- - valid_until bugünden 2 yıldan ileride olan test kayıtları hariçtir.
 -- - Abone: status boş olmayan ve EXPIRED olmayan kullanıcılar.
--- - Ücretli abone: status ACTIVE/CANCELED + valid_until_date >= date
--- - Churn: kullanıcının son ücretli kaydı ACTIVE/CANCELED değilse,
---   churn tarihi valid_until_date olarak kabul edilir.
+-- - Ücretli abone: lifecycle statüsünden bağımsız olarak created_date <= date <= valid_until_date.
+--   Böylece sonradan EXPIRED olan kayıtlar geçmiş ücretli abone sayımından silinmez.
+-- - Kaybedilmiş/churn: IN_GRACE, ON_HOLD veya EXPIRED statüsündeki kullanıcıdır.
+--   IN_GRACE/ON_HOLD kayıp tarihi valid_until; EXPIRED kayıp tarihi varsa
+--   grace/hold bitişi, yoksa valid_until tarihidir.
 -- - Grace period: status IN_GRACE/ON_HOLD + date > valid_until_date + date <= grace/hold end date
 -- - Parasal metrik yoktur.
 -- - Looker Studio tarih filtresi @DS_START_DATE / @DS_END_DATE parametreleriyle çalışır.
@@ -61,6 +63,23 @@ subs_base AS (
       )
       ELSE DATE(s.valid_until, 'Europe/Istanbul')
     END AS active_end_date,
+    CASE
+      WHEN UPPER(s.status) IN ('IN_GRACE', 'ON_HOLD')
+        THEN DATE(s.valid_until, 'Europe/Istanbul')
+      WHEN UPPER(s.status) = 'EXPIRED'
+        THEN GREATEST(
+          DATE(s.valid_until, 'Europe/Istanbul'),
+          COALESCE(
+            DATE(s.grace_until, 'Europe/Istanbul'),
+            DATE(s.valid_until, 'Europe/Istanbul')
+          ),
+          COALESCE(
+            DATE(s.hold_until, 'Europe/Istanbul'),
+            DATE(s.valid_until, 'Europe/Istanbul')
+          )
+        )
+      ELSE NULL
+    END AS lost_date,
     s.subscription_plan_id,
     s.amount
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
@@ -70,7 +89,7 @@ subs_base AS (
     AND s.valid_until IS NOT NULL
     AND s.subscription_plan_id IS NOT NULL
     AND s.amount IS NOT NULL
-    AND s.amount >= 101
+    AND s.amount > 101
     AND UPPER(COALESCE(s.payment_option, '')) != 'PREPAID'
     AND DATE(s.valid_until, 'Europe/Istanbul')
       <= DATE_ADD(CURRENT_DATE('Europe/Istanbul'), INTERVAL 2 YEAR)
@@ -121,8 +140,7 @@ daily_status_counts AS (
     )) AS subscriber_count,
 
     COUNT(DISTINCT IF(
-      status IN ('ACTIVE', 'CANCELED')
-      AND valid_until_date >= date,
+      valid_until_date >= date,
       user_id,
       NULL
     )) AS paid_subscriber_count,
@@ -184,6 +202,7 @@ last_paid_subscription AS (
     user_id,
     status,
     valid_until_date,
+    lost_date,
     ROW_NUMBER() OVER (
       PARTITION BY user_id
       ORDER BY valid_until_date DESC, created_date DESC, created_at DESC
@@ -193,13 +212,13 @@ last_paid_subscription AS (
 
 daily_churn AS (
   SELECT
-    valid_until_date AS date,
+    lost_date AS date,
     COUNT(DISTINCT user_id) AS churned_paid_subscriber_count
   FROM last_paid_subscription
   WHERE rn = 1
-    AND status NOT IN ('ACTIVE', 'CANCELED')
-    AND valid_until_date >= (SELECT start_date FROM params)
-    AND valid_until_date <= (SELECT end_date FROM params)
+    AND status IN ('IN_GRACE', 'ON_HOLD', 'EXPIRED')
+    AND lost_date >= (SELECT start_date FROM params)
+    AND lost_date <= (SELECT end_date FROM params)
   GROUP BY date
 ),
 
@@ -221,8 +240,7 @@ daily_average_tenure AS (
   FROM latest_sub_by_day l
   JOIN user_first_paid f
     ON l.user_id = f.user_id
-  WHERE l.status IN ('ACTIVE', 'CANCELED')
-    AND l.valid_until_date >= l.date
+  WHERE l.valid_until_date >= l.date
   GROUP BY l.date
 )
 

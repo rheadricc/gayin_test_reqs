@@ -181,7 +181,7 @@ active_subs AS (
   LEFT JOIN user_day_platform udp
     ON udp.user_id = cu.user_id
    AND udp.day = d.day
-  WHERE cu.status IN ('ACTIVE','CANCELED','IN_GRACE','ON_HOLD')
+  WHERE cu.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD', 'EXPIRED')
   GROUP BY 1,2,3,4
 ),
 

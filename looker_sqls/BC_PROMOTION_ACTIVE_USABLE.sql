@@ -215,7 +215,7 @@ active_subs AS (
   LEFT JOIN user_platform up ON cu.user_id = up.user_id
   WHERE DATE(cu.created_at) <= p.end_date
     AND DATE(cu.valid_until) >= p.end_date
-    AND cu.status IN ('CANCELED','ACTIVE')
+    AND cu.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD', 'EXPIRED')
   GROUP BY 1,2
 ),
 

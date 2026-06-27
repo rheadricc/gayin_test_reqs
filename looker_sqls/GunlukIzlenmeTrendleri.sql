@@ -7,6 +7,12 @@ params AS (
     PARSE_DATE('%Y%m%d', @DS_END_DATE) AS ds_end
 ),
 
+calendar AS (
+  SELECT day AS event_date
+  FROM params,
+  UNNEST(GENERATE_DATE_ARRAY(ds_start, ds_end)) AS day
+),
+
 contents AS (
   SELECT
     video_id,
@@ -54,11 +60,25 @@ base AS (
     AND v.event_date BETWEEN p.ds_start AND p.ds_end
 ),
 
+daily_content AS (
+  SELECT
+    event_date,
+    video_id,
+    COUNT(DISTINCT user_id) AS user_cnt,
+    COUNT(DISTINCT CONCAT(
+      CAST(user_id AS STRING), '|',
+      CAST(video_id AS STRING), '|',
+      IFNULL(CAST(ga_session_id AS STRING), 'no_session')
+    )) AS view_cnt
+  FROM base
+  GROUP BY event_date, video_id
+),
+
 content_totals AS (
   SELECT
     video_id,
-    COUNT(DISTINCT CONCAT(user_id, video_id, ga_session_id)) AS total_view_cnt
-  FROM base
+    SUM(view_cnt) AS total_view_cnt
+  FROM daily_content
   GROUP BY video_id
 ),
 
@@ -71,7 +91,7 @@ ranked_content AS (
 )
 
 SELECT
-  b.event_date,
+  cal.event_date,
   c.displayname AS content_name,
   c.season_info AS sezon,
 
@@ -88,21 +108,25 @@ SELECT
 
   r.content_rank,
 
-  COUNT(DISTINCT b.user_id) AS user_cnt,
-  COUNT(DISTINCT CONCAT(b.user_id, b.video_id, b.ga_session_id)) AS view_cnt
+  IFNULL(d.user_cnt, 0) AS user_cnt,
+  IFNULL(d.view_cnt, 0) AS view_cnt
 
-FROM base b
-JOIN ranked_content r
-  ON b.video_id = r.video_id
+FROM calendar cal
+CROSS JOIN ranked_content r
 JOIN contents_fixed c
-  ON b.video_id = c.video_id
+  ON r.video_id = c.video_id
+LEFT JOIN daily_content d
+  ON cal.event_date = d.event_date
+  AND r.video_id = d.video_id
 
 GROUP BY
-  b.event_date,
+  cal.event_date,
   c.displayname,
   c.season_info,
   bolum,
   c.contenttype_id,
   c.kategori,
   c.IsGainOriginals,
-  r.content_rank
+  r.content_rank,
+  d.user_cnt,
+  d.view_cnt

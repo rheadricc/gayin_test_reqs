@@ -7,11 +7,27 @@
 
 -- Looker Studio params:
 -- @DS_START_DATE , @DS_END_DATE -> format: YYYYMMDD
+--
+-- Looker kurulumu:
+-- 1) Platform Kullanım Dağılımı
+--    Boyut: platform
+--    Metrik: SUM(selected_period_platform_users)
+--    Tarih aralığı: sayfa filtresini devralmalı; ayrıca "Dün" filtresi verilmemeli.
+-- 2) Tekil İzleyici
+--    Metrik: SUM(daily_unique_watchers_anchor)
+-- 3) Ortalama İzleme Süresi
+--    Metrik: MAX(daily_avg_user_watch_time_anchor)
+--    Bu alan yalnızca watch_time_second ölçülebilen izleyicileri kapsar.
+-- 4) streaming_data_available = FALSE olan günlerde streaming kaynağı eksiktir;
+--    NULL değerler gerçek sıfır olarak yorumlanmamalıdır.
 
 WITH params AS (
   SELECT
     GREATEST(PARSE_DATE('%Y%m%d', @DS_START_DATE), DATE '2026-03-30') AS start_date,
-    PARSE_DATE('%Y%m%d', @DS_END_DATE) AS end_date
+    LEAST(
+      PARSE_DATE('%Y%m%d', @DS_END_DATE),
+      DATE_SUB(CURRENT_DATE('Europe/Istanbul'), INTERVAL 1 DAY)
+    ) AS end_date
 ),
 
 promo_map AS (
@@ -45,7 +61,7 @@ subs_campaign_history AS (
       pm.campaign,
       pm.campaign_detail,
       ROW_NUMBER() OVER (
-        PARTITION BY s.user_id
+        PARTITION BY s.user_id, ap.promotionId
         ORDER BY ap.applyDate DESC, s.created_at DESC
       ) AS rn
     FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
@@ -76,7 +92,7 @@ elastic_campaign_history AS (
       pm.campaign,
       pm.campaign_detail,
       ROW_NUMBER() OVER (
-        PARTITION BY eau.user_id
+        PARTITION BY eau.user_id, pm.promotionId
         ORDER BY SAFE_CAST(eau.valid_until AS TIMESTAMP) DESC,
                  SAFE_CAST(eau.created_at AS TIMESTAMP) DESC
       ) AS rn
@@ -154,6 +170,7 @@ campaign_users AS (
     cub.user_id,
     COALESCE(ec.email, cub.email) AS email,
     cub.created_at,
+    COALESCE(DATE(cub.applyDate), DATE(cub.created_at)) AS campaign_start_date,
     COALESCE(ec.valid_until, cub.valid_until) AS valid_until,
     COALESCE(ec.status, cub.status) AS status,
     cub.amount,
@@ -188,6 +205,8 @@ watch_base AS (
   SELECT
     cr.event_date AS day,
     cr.user_id,
+    cu.campaign,
+    cu.campaign_detail,
     CASE
       WHEN LOWER(cr.device_category) = 'smart tv' THEN 'TV'
       WHEN UPPER(cr.device_platform) = 'IOS' THEN 'iOS'
@@ -199,73 +218,95 @@ watch_base AS (
   FROM `microgain-9f959.looker_report.content_report_streaming_V2` cr
   JOIN campaign_users cu
     ON cr.user_id = cu.user_id
+   AND cr.event_date >= cu.campaign_start_date
   CROSS JOIN params p
   WHERE cr.event_date BETWEEN p.start_date AND p.end_date
+),
+
+streaming_day_coverage AS (
+  SELECT
+    cr.event_date AS day,
+    COUNT(*) AS source_event_rows,
+    COUNTIF(cr.watch_time_second IS NOT NULL) AS source_measured_rows
+  FROM `microgain-9f959.looker_report.content_report_streaming_V2` cr
+  CROSS JOIN params p
+  WHERE cr.event_date BETWEEN p.start_date AND p.end_date
+  GROUP BY cr.event_date
 ),
 
 watch_user_platform_day AS (
   SELECT
     day,
     user_id,
+    campaign,
+    campaign_detail,
     platform,
     SUM(watch_time_second) AS day_platform_watch_time,
     COUNT(*) AS day_platform_events
   FROM watch_base
-  GROUP BY 1,2,3
+  GROUP BY 1,2,3,4,5
 ),
 
-user_day_campaign_days AS (
-  SELECT
-    d.day,
-    cu.user_id
-  FROM date_spine d
-  JOIN campaign_users cu
-    ON d.day BETWEEN DATE(cu.created_at) AND DATE(cu.valid_until)
-),
-
-user_day_platform_scores AS (
-  SELECT
-    u.day,
-    u.user_id,
-    p.platform,
-    COALESCE(SUM(w.day_platform_watch_time), 0) AS cumulative_watch_time,
-    COALESCE(SUM(w.day_platform_events), 0) AS cumulative_events
-  FROM user_day_campaign_days u
-  CROSS JOIN platforms p
-  LEFT JOIN watch_user_platform_day w
-    ON w.user_id = u.user_id
-   AND w.platform = p.platform
-   AND w.day <= u.day
-  GROUP BY 1,2,3
-),
-
+/* Dominant platform for that specific day, only among users who watched. */
 user_day_platform AS (
   SELECT
     day,
     user_id,
-    CASE
-      WHEN cumulative_watch_time = 0 AND cumulative_events = 0 THEN 'Unknown'
-      ELSE platform
-    END AS platform
+    campaign,
+    campaign_detail,
+    platform
+  FROM watch_user_platform_day
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY day, user_id, campaign, campaign_detail
+    ORDER BY
+      IF(day_platform_watch_time > 0, 1, 0) DESC,
+      day_platform_watch_time DESC,
+      day_platform_events DESC,
+      platform
+  ) = 1
+),
+
+/* Dominant platform across the selected Looker period, only for watchers. */
+selected_period_user_platform AS (
+  SELECT
+    user_id,
+    campaign,
+    campaign_detail,
+    platform
   FROM (
     SELECT
-      day,
       user_id,
+      campaign,
+      campaign_detail,
       platform,
-      cumulative_watch_time,
-      cumulative_events,
-      ROW_NUMBER() OVER (
-        PARTITION BY day, user_id
-        ORDER BY cumulative_watch_time DESC, cumulative_events DESC, platform
-      ) AS rn
-    FROM user_day_platform_scores
+      SUM(day_platform_watch_time) AS selected_watch_time,
+      SUM(day_platform_events) AS selected_events
+    FROM watch_user_platform_day
+    GROUP BY user_id, campaign, campaign_detail, platform
   )
-  WHERE rn = 1
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY user_id, campaign, campaign_detail
+    ORDER BY
+      IF(selected_watch_time > 0, 1, 0) DESC,
+      selected_watch_time DESC,
+      selected_events DESC,
+      platform
+  ) = 1
+),
+
+selected_period_platform_distribution AS (
+  SELECT
+    campaign,
+    campaign_detail,
+    sp.platform,
+    COUNT(DISTINCT sp.user_id) AS selected_period_platform_users
+  FROM selected_period_user_platform sp
+  GROUP BY campaign, campaign_detail, sp.platform
 ),
 
 new_subs AS (
   SELECT
-    DATE(cu.created_at) AS day,
+    cu.campaign_start_date AS day,
     cu.campaign,
     cu.campaign_detail,
     COALESCE(udp.platform, 'Unknown') AS platform,
@@ -274,8 +315,10 @@ new_subs AS (
   CROSS JOIN params p
   LEFT JOIN user_day_platform udp
     ON udp.user_id = cu.user_id
-   AND udp.day = DATE(cu.created_at)
-  WHERE DATE(cu.created_at) BETWEEN p.start_date AND p.end_date
+   AND udp.campaign = cu.campaign
+   AND udp.campaign_detail = cu.campaign_detail
+   AND udp.day = cu.campaign_start_date
+  WHERE cu.campaign_start_date BETWEEN p.start_date AND p.end_date
   GROUP BY 1,2,3,4
 ),
 
@@ -288,11 +331,13 @@ active_subs AS (
     COUNT(DISTINCT cu.user_id) AS active_subscribers
   FROM date_spine d
   JOIN campaign_users cu
-    ON d.day BETWEEN DATE(cu.created_at) AND DATE(cu.valid_until)
+    ON d.day BETWEEN cu.campaign_start_date AND DATE(cu.valid_until)
   LEFT JOIN user_day_platform udp
     ON udp.user_id = cu.user_id
+   AND udp.campaign = cu.campaign
+   AND udp.campaign_detail = cu.campaign_detail
    AND udp.day = d.day
-  WHERE cu.status IN ('ACTIVE','CANCELED')
+  WHERE cu.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD', 'EXPIRED')
   GROUP BY 1,2,3,4
 ),
 
@@ -305,9 +350,11 @@ total_used_users AS (
     COUNT(DISTINCT cu.user_id) AS total_used_users
   FROM date_spine d
   JOIN campaign_users cu
-    ON DATE(cu.created_at) <= d.day
+    ON cu.campaign_start_date <= d.day
   LEFT JOIN user_day_platform udp
     ON udp.user_id = cu.user_id
+   AND udp.campaign = cu.campaign
+   AND udp.campaign_detail = cu.campaign_detail
    AND udp.day = d.day
   GROUP BY 1,2,3,4
 ),
@@ -321,10 +368,12 @@ churn AS (
     COUNT(DISTINCT cu.user_id) AS churn_users
   FROM date_spine d
   JOIN campaign_users cu
-    ON DATE(cu.created_at) <= d.day
+    ON cu.campaign_start_date <= d.day
    AND DATE(cu.valid_until) <= d.day
   LEFT JOIN user_day_platform udp
     ON udp.user_id = cu.user_id
+   AND udp.campaign = cu.campaign
+   AND udp.campaign_detail = cu.campaign_detail
    AND udp.day = d.day
   WHERE cu.status IN ('EXPIRED','IN_GRACE','ON_HOLD')
   GROUP BY 1,2,3,4
@@ -392,6 +441,8 @@ conversion_daily AS (
   CROSS JOIN params p
   LEFT JOIN user_day_platform udp
     ON udp.user_id = cb.user_id
+   AND udp.campaign = cb.campaign
+   AND udp.campaign_detail = cb.campaign_detail
    AND udp.day = DATE(cb.next_payment_date)
   WHERE DATE(cb.next_payment_date) BETWEEN p.start_date AND p.end_date
   GROUP BY 1,2,3,4
@@ -400,20 +451,40 @@ conversion_daily AS (
 watch_metrics AS (
   SELECT
     wb.day,
-    cu.campaign,
-    cu.campaign_detail,
+    wb.campaign,
+    wb.campaign_detail,
     COALESCE(udp.platform, 'Unknown') AS platform,
     COUNT(DISTINCT wb.user_id) AS unique_watchers,
     SUM(wb.watch_time_second) AS total_watch_time,
     COUNT(*) AS daily_watches,
-    SAFE_DIVIDE(SUM(wb.watch_time_second), COUNT(DISTINCT wb.user_id)) AS avg_user_watch_time
+    COUNT(DISTINCT IF(wb.watch_time_second > 0, wb.user_id, NULL)) AS measured_watchers,
+    SAFE_DIVIDE(
+      SUM(wb.watch_time_second),
+      COUNT(DISTINCT IF(wb.watch_time_second > 0, wb.user_id, NULL))
+    ) AS avg_user_watch_time
   FROM watch_base wb
-  JOIN campaign_users cu
-    ON cu.user_id = wb.user_id
   LEFT JOIN user_day_platform udp
     ON udp.user_id = wb.user_id
+   AND udp.campaign = wb.campaign
+   AND udp.campaign_detail = wb.campaign_detail
    AND udp.day = wb.day
   GROUP BY 1,2,3,4
+),
+
+watch_daily_summary AS (
+  SELECT
+    wb.day,
+    wb.campaign,
+    wb.campaign_detail,
+    COUNT(DISTINCT wb.user_id) AS daily_unique_watchers,
+    COUNT(DISTINCT IF(wb.watch_time_second > 0, wb.user_id, NULL)) AS daily_measured_watchers,
+    SUM(wb.watch_time_second) AS daily_total_watch_time,
+    SAFE_DIVIDE(
+      SUM(wb.watch_time_second),
+      COUNT(DISTINCT IF(wb.watch_time_second > 0, wb.user_id, NULL))
+    ) AS daily_avg_user_watch_time
+  FROM watch_base wb
+  GROUP BY wb.day, wb.campaign, wb.campaign_detail
 )
 
 SELECT
@@ -431,9 +502,47 @@ SELECT
   COALESCE(w.unique_watchers, 0)     AS unique_watchers,
   COALESCE(w.total_watch_time, 0)    AS total_watch_time,
   COALESCE(w.daily_watches, 0)       AS daily_watches,
-  COALESCE(w.avg_user_watch_time, 0) AS avg_user_watch_time
+  w.measured_watchers,
+  w.avg_user_watch_time,
+
+  /* Use this field for the platform donut with aggregation SUM or MAX. */
+  IF(
+    d.day = prm.end_date,
+    sppd.selected_period_platform_users,
+    NULL
+  ) AS selected_period_platform_users,
+
+  /*
+    Platform-independent daily anchors. They are populated on only one
+    platform row so SUM remains safe when platform is not a chart dimension.
+  */
+  IF(
+    p.platform = 'Unknown' AND sdc.day IS NOT NULL,
+    COALESCE(wds.daily_unique_watchers, 0),
+    NULL
+  ) AS daily_unique_watchers_anchor,
+  IF(
+    p.platform = 'Unknown' AND sdc.day IS NOT NULL,
+    wds.daily_measured_watchers,
+    NULL
+  ) AS daily_measured_watchers_anchor,
+  IF(
+    p.platform = 'Unknown' AND sdc.day IS NOT NULL,
+    COALESCE(wds.daily_total_watch_time, 0),
+    NULL
+  ) AS daily_total_watch_time_anchor,
+  IF(
+    p.platform = 'Unknown' AND sdc.day IS NOT NULL,
+    wds.daily_avg_user_watch_time,
+    NULL
+  ) AS daily_avg_user_watch_time_anchor,
+
+  sdc.day IS NOT NULL AS streaming_data_available,
+  COALESCE(sdc.source_event_rows, 0) AS streaming_source_event_rows,
+  COALESCE(sdc.source_measured_rows, 0) AS streaming_source_measured_rows
 
 FROM date_spine d
+CROSS JOIN params prm
 CROSS JOIN campaigns c
 CROSS JOIN platforms p
 LEFT JOIN total_used_users tu
@@ -466,5 +575,15 @@ LEFT JOIN watch_metrics w
  AND c.campaign = w.campaign
  AND c.campaign_detail = w.campaign_detail
  AND p.platform = w.platform
+LEFT JOIN selected_period_platform_distribution sppd
+  ON c.campaign = sppd.campaign
+ AND c.campaign_detail = sppd.campaign_detail
+ AND p.platform = sppd.platform
+LEFT JOIN watch_daily_summary wds
+  ON d.day = wds.day
+ AND c.campaign = wds.campaign
+ AND c.campaign_detail = wds.campaign_detail
+LEFT JOIN streaming_day_coverage sdc
+  ON d.day = sdc.day
 
 ORDER BY 1,2,3,4;

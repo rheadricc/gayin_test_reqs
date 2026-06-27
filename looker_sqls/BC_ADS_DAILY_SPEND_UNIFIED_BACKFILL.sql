@@ -1,9 +1,15 @@
--- SCHEDULED QUERY
--- Name: BC_ADS_DAILY_SPEND_UNIFIED_01
--- Schedule: Daily 04:00 UTC
+-- ONE-OFF BACKFILL
+-- Name: BC_ADS_DAILY_SPEND_UNIFIED_BACKFILL
 --
--- Normal production window. Historical loads use
--- BC_ADS_DAILY_SPEND_UNIFIED_BACKFILL.sql.
+-- Run only after the Google Ads and Meta Ads raw transfer runs for the
+-- requested period have completed. The MERGE key makes reruns idempotent:
+-- day + channel + account + campaign + source table.
+
+DECLARE backfill_start DATE DEFAULT DATE '2025-07-01';
+DECLARE backfill_end DATE DEFAULT DATE_SUB(
+  CURRENT_DATE('Europe/Istanbul'),
+  INTERVAL 1 DAY
+);
 
 CREATE TABLE IF NOT EXISTS `microgain-9f959.bc_marketing_marts.ads_daily_spend` (
   day DATE,
@@ -20,9 +26,8 @@ CREATE TABLE IF NOT EXISTS `microgain-9f959.bc_marketing_marts.ads_daily_spend` 
   loaded_at TIMESTAMP
 );
 
-MERGE `microgain-9f959.bc_marketing_marts.ads_daily_spend` T
+MERGE `microgain-9f959.bc_marketing_marts.ads_daily_spend` AS T
 USING (
-
   WITH google_spend AS (
     SELECT
       segments_date AS day,
@@ -38,18 +43,11 @@ USING (
       'p_ads_CampaignBasicStats_6861382209' AS source_table,
       CURRENT_TIMESTAMP() AS loaded_at
     FROM `microgain-9f959.bc_googleads_spend_raw.p_ads_CampaignBasicStats_6861382209`
-    WHERE segments_date BETWEEN DATE_SUB(
-                              CURRENT_DATE('Europe/Istanbul'),
-                              INTERVAL 35 DAY
-                            )
-                            AND DATE_SUB(
-                              CURRENT_DATE('Europe/Istanbul'),
-                              INTERVAL 1 DAY
-                            )
+    WHERE segments_date BETWEEN backfill_start AND backfill_end
     GROUP BY
       day, month, channel, source_platform,
       account_id, account_name, campaign_id, campaign_name,
-      currency, source_table, loaded_at
+      currency, source_table
   ),
 
   meta_spend AS (
@@ -67,26 +65,18 @@ USING (
       'AdInsights' AS source_table,
       CURRENT_TIMESTAMP() AS loaded_at
     FROM `microgain-9f959.bc_meta_spend_raw.AdInsights`
-    WHERE DateStart BETWEEN DATE_SUB(
-                          CURRENT_DATE('Europe/Istanbul'),
-                          INTERVAL 35 DAY
-                        )
-                        AND DATE_SUB(
-                          CURRENT_DATE('Europe/Istanbul'),
-                          INTERVAL 1 DAY
-                        )
+    WHERE DateStart BETWEEN backfill_start AND backfill_end
       AND UPPER(AccountCurrency) = 'TRY'
     GROUP BY
       day, month, channel, source_platform,
       account_id, account_name, campaign_id, campaign_name,
-      currency, source_table, loaded_at
+      currency, source_table
   )
 
   SELECT * FROM google_spend
   UNION ALL
   SELECT * FROM meta_spend
-
-) S
+) AS S
 ON  T.day = S.day
 AND T.channel = S.channel
 AND COALESCE(T.account_id, '') = COALESCE(S.account_id, '')
