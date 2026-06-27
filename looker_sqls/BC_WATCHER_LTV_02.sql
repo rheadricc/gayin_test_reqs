@@ -1,37 +1,29 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
--- Output: Heavy vs Light watcher LTV (TRY + foreign currency, paying users only)
--- REVIEW NOTE: This uses active-day prorated LTV and is closer to monthly realized LTV logic.
--- Logic:
---   - cohort window shifted back by 90 days
---   - first meaningful watch defines cohort entry
---   - watcher segment based on first 30-day watch time percentiles
---   - Light = bottom 30%
---   - Heavy = top 30%
---   - Middle excluded
---   - users with any daily watch above 24h in the first 30 days are excluded from segmentation
---   - users with less than 1 minute total watch time in the first 30 days are excluded from segmentation
---   - LTV uses TRY + foreign currency realized lifetime value
---   - Foreign currencies converted to TRY with TCMB forex_buying rate
---   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
---   - CANCELED users are counted as active until valid_until
---   - only users with converted TL LTV are included
+-- Name: BC_WATCHER_LTV_02
+--
+-- Watcher LTV universe:
+--   1) The user has made a real payment and has at least three complete
+--      observation months after the first payment.
+--   2) Churned users are included; current subscription status is not used.
+--   3) First 30-day watch behavior is calculated for those mature payers.
+--   4) Users with <1 minute total watch or any day >24h are excluded.
+--   5) Light = bottom 30%, Heavy = top 30%, Middle excluded from final chart.
+--
+-- LTV:
+--   Fixed first-three-month realized LTV. Only actual payment events from
+--   first_payment_date (inclusive) to first_payment_date + 3 months
+--   (exclusive) are included. Amounts are converted to TL, deduplicated and
+--   reduced by payment-provider commission. Tax is not deducted.
 
 WITH params AS (
   SELECT
     PARSE_DATE('%Y%m%d', @DS_START_DATE) AS ds_start,
-    PARSE_DATE('%Y%m%d', @DS_END_DATE)   AS ds_end
+    LEAST(
+      PARSE_DATE('%Y%m%d', @DS_END_DATE),
+      DATE_SUB(CURRENT_DATE('Europe/Istanbul'), INTERVAL 1 DAY)
+    ) AS snapshot_date
 ),
 
-cohort_window AS (
-  SELECT
-    DATE_SUB(ds_start, INTERVAL 90 DAY) AS cohort_start,
-    DATE_SUB(ds_end,   INTERVAL 90 DAY) AS cohort_end
-  FROM params
-),
-
-/* =====================================================
-   1) CONTENT MAP
-   ===================================================== */
 contents AS (
   SELECT
     CAST(video_id AS STRING) AS video_id,
@@ -41,9 +33,6 @@ contents AS (
   GROUP BY video_id
 ),
 
-/* =====================================================
-   2) STREAM EVENTS
-   ===================================================== */
 all_stream AS (
   SELECT
     CAST(user_id AS STRING) AS user_id,
@@ -59,12 +48,7 @@ all_stream AS (
 
 stream_with_genre AS (
   SELECT
-    s.user_id,
-    s.video_id,
-    s.Datetime_Ist,
-    s.event_date,
-    s.watch_time_second,
-    c.genre
+    s.*
   FROM all_stream s
   JOIN contents c
     ON TRIM(s.video_id) = TRIM(c.video_id)
@@ -72,261 +56,246 @@ stream_with_genre AS (
     AND TRIM(c.genre) != ''
 ),
 
-/* =====================================================
-   3) FIRST VALID WATCH / COHORT
-   ===================================================== */
 first_valid_watch AS (
   SELECT
     user_id,
     event_date AS first_watch_date
-  FROM (
-    SELECT
-      s.*,
-      ROW_NUMBER() OVER (
-        PARTITION BY user_id
-        ORDER BY Datetime_Ist ASC, video_id ASC
-      ) AS rn
-    FROM stream_with_genre s
-  )
-  WHERE rn = 1
+  FROM stream_with_genre
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY user_id
+    ORDER BY Datetime_Ist, video_id
+  ) = 1
 ),
 
-cohort AS (
+first_paid AS (
+  SELECT
+    CAST(s.user_id AS STRING) AS user_id,
+    MIN(DATE(s.created_at)) AS first_payment_date
+  FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
+  CROSS JOIN params p
+  WHERE s.user_id IS NOT NULL
+    AND s.payment_option IS NOT NULL
+    AND UPPER(TRIM(s.payment_option)) != 'PREPAID'
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
+    AND DATE(s.created_at) <= p.snapshot_date
+  GROUP BY user_id
+),
+
+mature_payers AS (
   SELECT
     f.user_id,
-    f.first_watch_date
-  FROM first_valid_watch f
-  CROSS JOIN cohort_window w
-  WHERE f.first_watch_date BETWEEN w.cohort_start AND w.cohort_end
+    f.first_payment_date,
+    DATE_ADD(f.first_payment_date, INTERVAL 3 MONTH) AS observation_end_date
+  FROM first_paid f
+  CROSS JOIN params p
+  WHERE DATE_ADD(f.first_payment_date, INTERVAL 3 MONTH) <= p.snapshot_date
 ),
 
-/* =====================================================
-   4) WATCHER SEGMENTATION WITH DAILY 24H CAP
-   ===================================================== */
 first_30d_user_day_watch AS (
   SELECT
-    c.user_id,
+    m.user_id,
     s.event_date,
-    SUM(COALESCE(s.watch_time_second, 0)) / 60.0 AS daily_watch_minutes
-  FROM cohort c
+    SUM(s.watch_time_second) / 60.0 AS daily_watch_minutes
+  FROM mature_payers m
+  JOIN first_valid_watch f
+    ON m.user_id = f.user_id
   JOIN all_stream s
-    ON s.user_id = c.user_id
+    ON m.user_id = s.user_id
    AND s.watch_time_second > 0
-   AND s.event_date BETWEEN c.first_watch_date
-                        AND DATE_ADD(c.first_watch_date, INTERVAL 30 DAY)
-  GROUP BY c.user_id, s.event_date
+   AND s.event_date BETWEEN f.first_watch_date
+                        AND DATE_ADD(f.first_watch_date, INTERVAL 30 DAY)
+  GROUP BY m.user_id, s.event_date
 ),
 
-first_30d_watch_time AS (
+first_30d_watch AS (
   SELECT
     user_id,
     SUM(daily_watch_minutes) AS watch_minutes_30d,
-    MAX(CASE WHEN daily_watch_minutes > 1440 THEN 1 ELSE 0 END) AS has_daily_watch_over_24h
+    MAX(IF(daily_watch_minutes > 1440, 1, 0)) AS has_daily_watch_over_24h
   FROM first_30d_user_day_watch
   GROUP BY user_id
 ),
 
-eligible_watcher_users AS (
+eligible_watchers AS (
   SELECT
     user_id,
     watch_minutes_30d
-  FROM first_30d_watch_time
+  FROM first_30d_watch
   WHERE watch_minutes_30d >= 1
     AND has_daily_watch_over_24h = 0
 ),
 
-percentile_bounds AS (
+ranked_watchers AS (
   SELECT
-    APPROX_QUANTILES(watch_minutes_30d, 100)[OFFSET(30)] AS p30_watch_minutes,
-    APPROX_QUANTILES(watch_minutes_30d, 100)[OFFSET(70)] AS p70_watch_minutes
-  FROM eligible_watcher_users
+    user_id,
+    watch_minutes_30d,
+    NTILE(10) OVER (
+      ORDER BY watch_minutes_30d, user_id
+    ) AS watch_decile
+  FROM eligible_watchers
 ),
 
 watcher_segment AS (
   SELECT
-    w.user_id,
-    w.watch_minutes_30d,
+    user_id,
+    watch_minutes_30d,
     CASE
-      WHEN w.watch_minutes_30d <= b.p30_watch_minutes THEN 'Light'
-      WHEN w.watch_minutes_30d >= b.p70_watch_minutes THEN 'Heavy'
+      WHEN watch_decile <= 3 THEN 'Light'
+      WHEN watch_decile >= 8 THEN 'Heavy'
       ELSE 'Middle'
     END AS watcher_type
-  FROM eligible_watcher_users w
-  CROSS JOIN percentile_bounds b
+  FROM ranked_watchers
 ),
 
-/* =====================================================
-   5) USER LTV - TRY + FX CONVERTED TO TL
-   ===================================================== */
 payment_option_config AS (
-  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate UNION ALL
+  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate UNION ALL
+  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate
 ),
 
 tcmb_rates AS (
   SELECT
     DATE(rate_date) AS rate_date,
     UPPER(currency_code) AS currency_code,
-    SAFE_DIVIDE(CAST(forex_buying AS FLOAT64), NULLIF(CAST(unit AS FLOAT64), 0.0)) AS rate_to_try
+    SAFE_DIVIDE(
+      CAST(forex_buying AS FLOAT64),
+      NULLIF(CAST(unit AS FLOAT64), 0.0)
+    ) AS rate_to_try
   FROM `microgain-9f959.bc_t.tcmb_exchange_rates_raw`
   WHERE currency_code IS NOT NULL
     AND forex_buying IS NOT NULL
     AND unit IS NOT NULL
 ),
 
-subs AS (
+payment_base AS (
   SELECT
-    s.user_id,
-    s.payment_option,
+    CAST(s.user_id AS STRING) AS user_id,
+    UPPER(TRIM(s.payment_option)) AS payment_option,
     UPPER(TRIM(s.currency)) AS currency_code,
-    s.status,
     s.created_at,
     s.inserted_date,
-    DATE(s.created_at)  AS created_date,
+    DATE(s.created_at) AS payment_date,
     DATE(s.valid_until) AS valid_until_date,
-    DATE(s.grace_until) AS grace_until_date,
-    DATE(s.hold_until)  AS hold_until_date,
-    CASE
-      WHEN s.status = 'ON_HOLD'  THEN COALESCE(DATE(s.hold_until),  DATE(s.valid_until))
-      WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
-      ELSE DATE(s.valid_until)
-    END AS active_end_date,
-    SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
+    s.apple_original_transaction_id,
+    s.google_original_transaction_id,
+    SAFE_DIVIDE(
+      CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64),
+      100.0
+    ) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
+  CROSS JOIN params p
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
-    AND s.payment_option != 'PREPAID'
-    AND s.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD')
+    AND UPPER(TRIM(s.payment_option)) != 'PREPAID'
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
+    AND DATE(s.created_at) <= p.snapshot_date
 ),
 
-subs_with_rate_candidates AS (
+payment_rate_candidates AS (
   SELECT
-    s.*,
-    r.rate_date AS matched_rate_date,
+    p.*,
     r.rate_to_try,
     ROW_NUMBER() OVER (
       PARTITION BY
-        CAST(s.user_id AS STRING),
-        s.payment_option,
-        s.currency_code,
-        s.created_at,
-        s.inserted_date,
-        s.valid_until_date,
-        CAST(s.amount_original AS STRING)
-      ORDER BY r.rate_date DESC
+        p.user_id,
+        p.payment_option,
+        p.currency_code,
+        p.created_at,
+        p.inserted_date,
+        p.valid_until_date,
+        p.apple_original_transaction_id,
+        p.google_original_transaction_id,
+        CAST(p.amount_original AS STRING)
+      ORDER BY DATE(r.rate_date) DESC
     ) AS rate_rn
-  FROM subs s
+  FROM payment_base p
   LEFT JOIN tcmb_rates r
-    ON s.currency_code != 'TRY'
-   AND r.currency_code = s.currency_code
-   AND r.rate_date <= s.created_date
+    ON p.currency_code != 'TRY'
+   AND r.currency_code = p.currency_code
+   AND r.rate_date <= p.payment_date
 ),
 
-subs_converted AS (
+payment_converted AS (
   SELECT
     * EXCEPT(rate_rn),
     CASE
       WHEN currency_code = 'TRY' THEN amount_original
       ELSE amount_original * rate_to_try
     END AS amount_gross_tl
-  FROM subs_with_rate_candidates
+  FROM payment_rate_candidates
   WHERE currency_code = 'TRY'
      OR rate_rn = 1
 ),
 
-days AS (
+payment_events AS (
   SELECT
-    d AS dt
-  FROM params,
-  UNNEST(GENERATE_DATE_ARRAY(DATE '2021-01-01', ds_end)) AS d
-),
-
-daily_active_raw AS (
-  SELECT
-    d.dt,
-    s.user_id,
-    s.payment_option,
-    s.amount_gross_tl,
-    s.created_at,
-    s.inserted_date
-  FROM days d
-  JOIN subs_converted s
-    ON d.dt BETWEEN s.created_date AND s.active_end_date
-   AND s.amount_gross_tl IS NOT NULL
-),
-
-daily_active_dedup AS (
-  SELECT
-    r.dt,
-    r.user_id,
-    r.payment_option,
-    r.amount_gross_tl
-  FROM (
-    SELECT
-      r.*,
-      ROW_NUMBER() OVER (
-        PARTITION BY r.dt, r.user_id
-        ORDER BY r.created_at DESC, r.inserted_date DESC
-      ) AS rn
-    FROM daily_active_raw r
-  ) r
-  WHERE r.rn = 1
-),
-
-daily_revenue AS (
-  SELECT
-    a.dt,
-    a.user_id,
-    SAFE_DIVIDE(
-      a.amount_gross_tl
-      * (1.0 - COALESCE(c.commission_rate, 0.00))
-      * (1.0 - COALESCE(c.tax_rate, 0.20)),
-      EXTRACT(DAY FROM LAST_DAY(a.dt))
-    ) AS daily_rev_tl
-  FROM daily_active_dedup a
-  LEFT JOIN payment_option_config c
-    ON a.payment_option = c.payment_option
+    user_id,
+    payment_option,
+    payment_date,
+    amount_gross_tl
+  FROM payment_converted
+  WHERE amount_gross_tl IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY
+      user_id,
+      payment_option,
+      currency_code,
+      created_at,
+      valid_until_date,
+      apple_original_transaction_id,
+      google_original_transaction_id,
+      CAST(amount_original AS STRING)
+    ORDER BY inserted_date DESC
+  ) = 1
 ),
 
 user_ltv AS (
   SELECT
-    CAST(user_id AS STRING) AS user_id,
-    SUM(daily_rev_tl) AS user_ltv_tl
-  FROM daily_revenue
-  GROUP BY user_id
-),
-
-/* =====================================================
-   6) FINAL
-   ===================================================== */
-final AS (
-  SELECT
-    w.watcher_type,
-    COUNT(DISTINCT w.user_id) AS users,
-    AVG(w.watch_minutes_30d) AS avg_watch_minutes_30d,
-    AVG(l.user_ltv_tl) AS avg_ltv_tl,
-    APPROX_QUANTILES(l.user_ltv_tl, 100)[OFFSET(50)] AS median_ltv_tl,
-    SUM(l.user_ltv_tl) AS total_ltv_tl
-  FROM watcher_segment w
-  JOIN user_ltv l
-    ON w.user_id = l.user_id
-  WHERE w.watcher_type IN ('Light', 'Heavy')
-  GROUP BY w.watcher_type
+    p.user_id,
+    COUNT(*) AS payment_count_3m,
+    SUM(
+      p.amount_gross_tl
+        * (1.0 - COALESCE(c.commission_rate, 0.00))
+    ) AS realized_ltv_3m_tl
+  FROM payment_events p
+  JOIN mature_payers m
+    ON p.user_id = m.user_id
+   AND p.payment_date >= m.first_payment_date
+   AND p.payment_date < m.observation_end_date
+  LEFT JOIN payment_option_config c
+    ON p.payment_option = c.payment_option
+  GROUP BY p.user_id
 )
 
 SELECT
-  watcher_type,
-  users,
-  avg_watch_minutes_30d,
-  avg_ltv_tl,
-  median_ltv_tl,
-  total_ltv_tl
-FROM final
+  w.watcher_type,
+  COUNT(DISTINCT w.user_id) AS users,
+  AVG(w.watch_minutes_30d) AS avg_watch_minutes_30d,
+  3 AS observation_months,
+  AVG(COALESCE(l.payment_count_3m, 0)) AS avg_payment_count_3m,
+  AVG(COALESCE(l.realized_ltv_3m_tl, 0.0)) AS avg_realized_ltv_3m_tl,
+  APPROX_QUANTILES(
+    COALESCE(l.realized_ltv_3m_tl, 0.0),
+    100
+  )[OFFSET(50)] AS median_realized_ltv_3m_tl,
+  SUM(COALESCE(l.realized_ltv_3m_tl, 0.0)) AS total_realized_ltv_3m_tl,
+  -- Compatibility aliases for the existing Looker chart.
+  AVG(COALESCE(l.payment_count_3m, 0)) AS avg_payment_count,
+  AVG(COALESCE(l.realized_ltv_3m_tl, 0.0)) AS avg_ltv_tl,
+  APPROX_QUANTILES(
+    COALESCE(l.realized_ltv_3m_tl, 0.0),
+    100
+  )[OFFSET(50)] AS median_ltv_tl,
+  SUM(COALESCE(l.realized_ltv_3m_tl, 0.0)) AS total_ltv_tl
+FROM watcher_segment w
+LEFT JOIN user_ltv l
+  ON w.user_id = l.user_id
+WHERE w.watcher_type IN ('Light', 'Heavy')
+GROUP BY w.watcher_type
 ORDER BY
-  CASE watcher_type
+  CASE w.watcher_type
     WHEN 'Light' THEN 1
     WHEN 'Heavy' THEN 2
     ELSE 99

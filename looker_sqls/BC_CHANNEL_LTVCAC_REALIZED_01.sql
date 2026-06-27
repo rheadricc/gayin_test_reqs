@@ -1,30 +1,63 @@
 -- Looker Studio params: @DS_START_DATE, @DS_END_DATE (YYYYMMDD)
 -- Name: BC_CHANNEL_LTVCAC_REALIZED_01
--- Output:
---   1) channel_scope = 'selected_period'  -> one row per channel for selected range
---   2) channel_scope = 'monthly'          -> one row per month per channel
+-- Purpose: "Reklam Kanalı LTV" chart only.
+-- Output: exactly one row per channel for the latest six fully matured
+-- acquisition-cohort months available as of @DS_END_DATE.
+--
+-- Looker setup:
+--   Dimension = channel
+--   Metric    = avg_realized_ltv_tl
+--   No channel_scope filter is required.
+--
+-- Only channels with automated spend in ads_daily_spend are returned. A GA4
+-- touch alone cannot create a channel row. This prevents an old TikTok touch
+-- from appearing when no comparable TikTok spend source exists.
 -- Standardized:
---   - acquisition cohort = first paid users in selected range
+--   - acquisition cohort = first paid users in selected range with a complete
+--     three-month observation window
 --   - attribution = last eligible paid touch within 30 days before first paid
 --   - spend source = bc_marketing_marts.ads_daily_spend
---   - LTV = TRY + foreign currency realized net revenue up to ds_end
+--   - LTV = actual net payment collections in each user's first three months
+--   - churned users are included
+--   - CAC spend and users use the same mature acquisition-cohort months
 --   - Foreign currencies converted to TRY with TCMB forex_buying rate
 --   - If exact payment date rate is missing, latest available TCMB rate before payment date is used
---   - CANCELED users are counted as active until valid_until
+--   - raw minor-unit amount must be > 101
 --   - channels with spend but 0 attributed users are preserved
 
 WITH params AS (
   SELECT
     PARSE_DATE('%Y%m%d', @DS_START_DATE) AS ds_start,
-    PARSE_DATE('%Y%m%d', @DS_END_DATE)   AS ds_end
+    LEAST(
+      PARSE_DATE('%Y%m%d', @DS_END_DATE),
+      DATE_SUB(CURRENT_DATE('Europe/Istanbul'), INTERVAL 1 DAY)
+    ) AS ds_end,
+    LEAST(
+      PARSE_DATE('%Y%m%d', @DS_START_DATE),
+      -- Read enough history to find the latest six fully matured cohort months
+      -- even when Looker sends its default last-28-days date range.
+      DATE_SUB(
+        DATE_TRUNC(
+          DATE_SUB(
+            LEAST(
+              PARSE_DATE('%Y%m%d', @DS_END_DATE),
+              DATE_SUB(CURRENT_DATE('Europe/Istanbul'), INTERVAL 1 DAY)
+            ),
+            INTERVAL 3 MONTH
+          ),
+          MONTH
+        ),
+        INTERVAL 6 MONTH
+      )
+    ) AS cohort_start
 ),
 
 payment_option_config AS (
-  SELECT 'APP_STORE'       AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'PLAY_STORE'      AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'MOBILE_PAYMENT'  AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'CRAFTGATE'       AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+  SELECT 'APP_STORE'       AS payment_option, 0.30 AS commission_rate UNION ALL
+  SELECT 'PLAY_STORE'      AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'MOBILE_PAYMENT'  AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'CRAFTGATE'       AS payment_option, 0.00 AS commission_rate UNION ALL
+  SELECT 'IYZICO'          AS payment_option, 0.03 AS commission_rate
 ),
 
 tcmb_rates AS (
@@ -38,48 +71,28 @@ tcmb_rates AS (
     AND unit IS NOT NULL
 ),
 
-history_start AS (
-  SELECT MIN(DATE(created_at)) AS hist_start
-  FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment`
-  WHERE user_id IS NOT NULL
-    AND payment_option IS NOT NULL
-    AND UPPER(TRIM(payment_option)) != 'PREPAID'
-),
-
-ltv_subs AS (
+payment_base AS (
   SELECT
     CAST(s.user_id AS STRING) AS user_id,
-    s.status,
     UPPER(TRIM(s.payment_option)) AS payment_option,
+    UPPER(TRIM(s.currency)) AS currency_code,
     s.created_at,
     s.inserted_date,
-    DATE(s.created_at) AS created_date,
-    CASE
-      WHEN s.status = 'ON_HOLD'  THEN COALESCE(DATE(s.hold_until),  DATE(s.valid_until))
-      WHEN s.status = 'IN_GRACE' THEN COALESCE(DATE(s.grace_until), DATE(s.valid_until))
-      ELSE DATE(s.valid_until)
-    END AS active_end_date,
+    DATE(s.created_at) AS payment_date,
     DATE(s.valid_until) AS valid_until_date,
-    UPPER(TRIM(s.currency)) AS currency_code,
+    s.apple_original_transaction_id,
+    s.google_original_transaction_id,
     SAFE_DIVIDE(CAST(COALESCE(s.amount, s.amount_before_promotions, 0) AS FLOAT64), 100.0) AS amount_original
   FROM `microgain-9f959.aws_s3_to_bq_migration.subs_payment` s
   CROSS JOIN params p
-  CROSS JOIN history_start h
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND UPPER(TRIM(s.payment_option)) != 'PREPAID'
-    AND s.status IN ('ACTIVE', 'CANCELED', 'IN_GRACE', 'ON_HOLD')
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
     AND DATE(s.created_at) <= p.ds_end
-    AND DATE(
-      CASE
-        WHEN s.status = 'ON_HOLD'  THEN COALESCE(s.hold_until,  s.valid_until)
-        WHEN s.status = 'IN_GRACE' THEN COALESCE(s.grace_until, s.valid_until)
-        ELSE s.valid_until
-      END
-    ) >= h.hist_start
 ),
 
-ltv_subs_with_rate_candidates AS (
+payment_rate_candidates AS (
   SELECT
     s.*,
     r.rate_date AS matched_rate_date,
@@ -95,73 +108,57 @@ ltv_subs_with_rate_candidates AS (
         CAST(s.amount_original AS STRING)
       ORDER BY r.rate_date DESC
     ) AS rate_rn
-  FROM ltv_subs s
+  FROM payment_base s
   LEFT JOIN tcmb_rates r
     ON s.currency_code != 'TRY'
    AND r.currency_code = s.currency_code
-   AND r.rate_date <= s.created_date
+   AND r.rate_date <= s.payment_date
 ),
 
-ltv_subs_converted AS (
+payment_converted AS (
   SELECT
     * EXCEPT(rate_rn),
     CASE
       WHEN currency_code = 'TRY' THEN amount_original
       ELSE amount_original * rate_to_try
     END AS amount_gross_tl
-  FROM ltv_subs_with_rate_candidates
+  FROM payment_rate_candidates
   WHERE currency_code = 'TRY'
      OR rate_rn = 1
 ),
 
-ltv_days AS (
-  SELECT d AS dt
-  FROM params p
-  CROSS JOIN history_start h
-  CROSS JOIN UNNEST(GENERATE_DATE_ARRAY(h.hist_start, p.ds_end)) AS d
-),
-
-ltv_daily_active_raw AS (
-  SELECT d.dt, s.user_id, s.payment_option, s.amount_gross_tl, s.created_at, s.inserted_date
-  FROM ltv_days d
-  JOIN ltv_subs_converted s
-    ON d.dt BETWEEN s.created_date AND s.active_end_date
-   AND s.amount_gross_tl IS NOT NULL
-),
-
-ltv_daily_active_dedup AS (
-  SELECT dt, user_id, payment_option, amount_gross_tl
+payment_events_dedup AS (
+  SELECT user_id, payment_option, payment_date, amount_gross_tl
   FROM (
     SELECT
-      r.*,
+      p.*,
       ROW_NUMBER() OVER (
-        PARTITION BY r.dt, r.user_id
-        ORDER BY r.created_at DESC, r.inserted_date DESC
-      ) AS rn
-    FROM ltv_daily_active_raw r
+        PARTITION BY
+          p.user_id,
+          p.payment_option,
+          p.currency_code,
+          p.created_at,
+          p.valid_until_date,
+          p.apple_original_transaction_id,
+          p.google_original_transaction_id,
+          CAST(p.amount_original AS STRING)
+        ORDER BY p.inserted_date DESC
+      ) AS payment_rn
+    FROM payment_converted p
+    WHERE p.amount_gross_tl IS NOT NULL
   )
-  WHERE rn = 1
+  WHERE payment_rn = 1
 ),
 
-daily_user_revenue AS (
+payment_events AS (
   SELECT
-    a.dt,
-    a.user_id,
-    SAFE_DIVIDE(
-      a.amount_gross_tl
-      * (1.0 - COALESCE(c.commission_rate, 0.00))
-      * (1.0 - COALESCE(c.tax_rate, 0.20)),
-      EXTRACT(DAY FROM LAST_DAY(a.dt))
-    ) AS net_rev_tl
-  FROM ltv_daily_active_dedup a
+    p.user_id,
+    p.payment_date,
+    p.amount_gross_tl
+      * (1.0 - COALESCE(c.commission_rate, 0.00)) AS amount_net_tl
+  FROM payment_events_dedup p
   LEFT JOIN payment_option_config c
-    ON a.payment_option = c.payment_option
-),
-
-user_realized_ltv AS (
-  SELECT user_id, SUM(net_rev_tl) AS user_realized_ltv_tl
-  FROM daily_user_revenue
-  GROUP BY user_id
+    ON p.payment_option = c.payment_option
 ),
 
 paid_payment_base AS (
@@ -175,7 +172,7 @@ paid_payment_base AS (
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND UPPER(TRIM(s.payment_option)) != 'PREPAID'
-    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 0
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
     AND DATE(s.created_at) <= p.ds_end
 ),
 
@@ -206,7 +203,11 @@ paid_payments AS (
     currency_code,
     amount_original,
     matched_rate_date,
-    rate_to_try
+    rate_to_try,
+    CASE
+      WHEN currency_code = 'TRY' THEN amount_original
+      ELSE amount_original * rate_to_try
+    END AS amount_gross_tl
   FROM paid_payment_rate_candidates
   WHERE currency_code = 'TRY'
      OR rate_rn = 1
@@ -217,8 +218,7 @@ first_paid AS (
     user_id,
     MIN(payment_date) AS first_paid_date
   FROM paid_payments
-  WHERE currency_code = 'TRY'
-     OR rate_to_try IS NOT NULL
+  WHERE currency_code = 'TRY' OR rate_to_try IS NOT NULL
   GROUP BY user_id
 ),
 
@@ -226,10 +226,31 @@ first_paid_selected AS (
   SELECT
     fp.user_id,
     fp.first_paid_date,
-    DATE_TRUNC(fp.first_paid_date, MONTH) AS cohort_month
+    DATE_TRUNC(fp.first_paid_date, MONTH) AS cohort_month,
+    DATE_ADD(fp.first_paid_date, INTERVAL 3 MONTH) AS observation_end_date
   FROM first_paid fp
   CROSS JOIN params p
-  WHERE fp.first_paid_date BETWEEN p.ds_start AND p.ds_end
+  WHERE fp.first_paid_date BETWEEN p.cohort_start AND p.ds_end
+    -- Use only fully matured cohort months. A partial March cohort must not be
+    -- divided into the full March ad spend before every March payer completes
+    -- the same three-month observation window.
+    AND DATE_ADD(
+          LAST_DAY(DATE_TRUNC(fp.first_paid_date, MONTH)),
+          INTERVAL 3 MONTH
+        ) <= p.ds_end
+),
+
+user_realized_ltv AS (
+  SELECT
+    f.user_id,
+    COUNT(*) AS payment_count_3m,
+    SUM(e.amount_net_tl) AS user_realized_ltv_tl
+  FROM first_paid_selected f
+  JOIN payment_events e
+    ON f.user_id = e.user_id
+   AND e.payment_date >= f.first_paid_date
+   AND e.payment_date < f.observation_end_date
+  GROUP BY f.user_id
 ),
 
 normalized_touches AS (
@@ -239,6 +260,10 @@ normalized_touches AS (
     LOWER(TRIM(CAST(g.source AS STRING))) AS source,
     LOWER(TRIM(CAST(g.medium AS STRING))) AS medium,
     LOWER(TRIM(COALESCE(CAST(g.campaign AS STRING), 'null'))) AS campaign,
+    REGEXP_CONTAINS(
+      LOWER(TRIM(COALESCE(CAST(g.medium AS STRING), ''))),
+      r'(^|[-_])(cpc|cpa|cpm|paid|conversion)([-_]|$)|instagram_(reels|stories|feed)|facebook_(mobile_|desktop_)?(reels|feed|stories)|facebook_right_column'
+    ) AS is_paid_touch,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(TRIM(CONCAT(COALESCE(CAST(g.mapped_channel AS STRING), ''), ' ', COALESCE(CAST(g.source AS STRING), ''), ' ', COALESCE(CAST(g.medium AS STRING), ''), ' ', COALESCE(CAST(g.campaign AS STRING), '')))), r'google|adwords|gads|youtube') THEN 'google'
       WHEN REGEXP_CONTAINS(LOWER(TRIM(CONCAT(COALESCE(CAST(g.mapped_channel AS STRING), ''), ' ', COALESCE(CAST(g.source AS STRING), ''), ' ', COALESCE(CAST(g.medium AS STRING), ''), ' ', COALESCE(CAST(g.campaign AS STRING), '')))), r'meta|facebook|instagram|fb|ig|l\.instagram|m\.facebook|l\.facebook') THEN 'meta'
@@ -250,7 +275,8 @@ normalized_touches AS (
     END AS channel
   FROM `microgain-9f959.bc_marketing_raw.ga4_first_non_direct_touch` g
   CROSS JOIN params p
-  WHERE g.touch_date BETWEEN DATE_SUB(p.ds_start, INTERVAL 30 DAY) AND p.ds_end
+  WHERE g.touch_date BETWEEN DATE_SUB(p.cohort_start, INTERVAL 30 DAY)
+                         AND p.ds_end
 ),
 
 user_channel_full AS (
@@ -263,6 +289,7 @@ user_channel_full AS (
   LEFT JOIN normalized_touches t
     ON fp.user_id = t.user_id
    AND DATE_DIFF(fp.first_paid_date, t.touch_date, DAY) BETWEEN 0 AND 30
+   AND t.is_paid_touch
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY fp.user_id
     ORDER BY
@@ -272,69 +299,37 @@ user_channel_full AS (
   ) = 1
 ),
 
-spend_raw AS (
-  SELECT
-    month,
-    LOWER(TRIM(CAST(channel AS STRING))) AS raw_channel,
-    SUM(spend_tl) AS spend_tl
-  FROM `microgain-9f959.bc_marketing_marts.ads_daily_spend`
-  CROSS JOIN params p
-  WHERE month BETWEEN DATE_TRUNC(p.ds_start, MONTH) AND DATE_TRUNC(p.ds_end, MONTH)
-  GROUP BY month, raw_channel
-),
-
 spend_monthly AS (
   SELECT
     month,
     CASE
-      WHEN REGEXP_CONTAINS(raw_channel, r'google|adwords|gads|youtube') THEN 'google'
-      WHEN REGEXP_CONTAINS(raw_channel, r'meta|facebook|instagram|fb|ig|paid_social|social') THEN 'meta'
-      WHEN REGEXP_CONTAINS(raw_channel, r'tiktok|tik_tok') THEN 'tiktok'
-      WHEN REGEXP_CONTAINS(raw_channel, r'influencer|creator') THEN 'influencer'
-      WHEN REGEXP_CONTAINS(raw_channel, r'affiliate|partner') THEN 'affiliate'
-      ELSE 'other'
+      WHEN REGEXP_CONTAINS(LOWER(TRIM(channel)), r'google|adwords|gads|youtube') THEN 'google'
+      WHEN REGEXP_CONTAINS(LOWER(TRIM(channel)), r'meta|facebook|instagram|fb|ig|paid_social|social') THEN 'meta'
+      WHEN REGEXP_CONTAINS(LOWER(TRIM(channel)), r'tiktok|tik_tok') THEN 'tiktok'
+      ELSE LOWER(TRIM(channel))
     END AS channel,
     SUM(spend_tl) AS spend_tl
-  FROM spend_raw
+  FROM `microgain-9f959.bc_marketing_marts.ads_daily_spend`
+  CROSS JOIN params p
+  WHERE month BETWEEN DATE_TRUNC(p.cohort_start, MONTH)
+                  AND DATE_TRUNC(p.ds_end, MONTH)
   GROUP BY month, channel
 ),
 
-monthly_channel_user_metrics AS (
-  SELECT
-    uc.cohort_month AS month,
-    uc.channel,
-    COUNT(DISTINCT uc.user_id) AS users,
-    AVG(COALESCE(l.user_realized_ltv_tl, 0)) AS avg_realized_ltv_tl,
-    APPROX_QUANTILES(COALESCE(l.user_realized_ltv_tl, 0), 100)[OFFSET(50)] AS median_realized_ltv_tl,
-    SUM(COALESCE(l.user_realized_ltv_tl, 0)) AS total_realized_ltv_tl
-  FROM user_channel_full uc
-  LEFT JOIN user_realized_ltv l
-    ON uc.user_id = l.user_id
-  GROUP BY uc.cohort_month, uc.channel
+mature_cohort_months AS (
+  SELECT month
+  FROM (
+    SELECT DISTINCT cohort_month AS month
+    FROM first_paid_selected
+  )
+  QUALIFY DENSE_RANK() OVER (ORDER BY month DESC) <= 6
 ),
 
-monthly_channel_final AS (
-  SELECT
-    'monthly' AS channel_scope,
-    COALESCE(s.month, m.month) AS month,
-    COALESCE(s.channel, m.channel) AS channel,
-    COALESCE(m.users, 0) AS users,
-    COALESCE(s.spend_tl, 0) AS spend_tl,
-    SAFE_DIVIDE(COALESCE(s.spend_tl, 0), COALESCE(m.users, 0)) AS cac_tl,
-    COALESCE(m.avg_realized_ltv_tl, 0) AS avg_realized_ltv_tl,
-    COALESCE(m.median_realized_ltv_tl, 0) AS median_realized_ltv_tl,
-    COALESCE(m.total_realized_ltv_tl, 0) AS total_realized_ltv_tl,
-    SAFE_DIVIDE(COALESCE(m.avg_realized_ltv_tl, 0), SAFE_DIVIDE(COALESCE(s.spend_tl, 0), COALESCE(m.users, 0))) AS ltv_cac_ratio,
-    CASE
-      WHEN COALESCE(s.spend_tl, 0) > 0 AND COALESCE(m.users, 0) > 0 THEN 'ok'
-      WHEN COALESCE(s.spend_tl, 0) > 0 AND COALESCE(m.users, 0) = 0 THEN 'spend_var_user_yok'
-      WHEN COALESCE(s.spend_tl, 0) = 0 AND COALESCE(m.users, 0) > 0 THEN 'spend_yok_user_var'
-      ELSE 'spend_yok_user_yok'
-    END AS cac_status
+eligible_spend_monthly AS (
+  SELECT s.*
   FROM spend_monthly s
-  FULL OUTER JOIN monthly_channel_user_metrics m
+  JOIN mature_cohort_months m
     ON s.month = m.month
-   AND s.channel = m.channel
 ),
 
 selected_channel_user_metrics AS (
@@ -343,48 +338,73 @@ selected_channel_user_metrics AS (
     COUNT(DISTINCT uc.user_id) AS users,
     AVG(COALESCE(l.user_realized_ltv_tl, 0)) AS avg_realized_ltv_tl,
     APPROX_QUANTILES(COALESCE(l.user_realized_ltv_tl, 0), 100)[OFFSET(50)] AS median_realized_ltv_tl,
-    SUM(COALESCE(l.user_realized_ltv_tl, 0)) AS total_realized_ltv_tl
+    SUM(COALESCE(l.user_realized_ltv_tl, 0)) AS total_realized_ltv_tl,
+    AVG(COALESCE(l.payment_count_3m, 0)) AS avg_payment_count_3m
   FROM user_channel_full uc
+  JOIN eligible_spend_monthly s
+    ON uc.cohort_month = s.month
+   AND uc.channel = s.channel
   LEFT JOIN user_realized_ltv l
     ON uc.user_id = l.user_id
+  WHERE uc.channel IN ('google', 'meta', 'tiktok')
   GROUP BY uc.channel
 ),
 
 selected_spend AS (
   SELECT channel, SUM(spend_tl) AS spend_tl
-  FROM spend_monthly
+  FROM eligible_spend_monthly
   GROUP BY channel
+),
+
+selected_window AS (
+  SELECT
+    MIN(month) AS cohort_start_month,
+    MAX(month) AS cohort_end_month,
+    DATE_ADD(LAST_DAY(MAX(month)), INTERVAL 3 MONTH) AS observation_window_end,
+    COUNT(DISTINCT month) AS loaded_cohort_month_count
+  FROM eligible_spend_monthly
 ),
 
 selected_channel_final AS (
   SELECT
     'selected_period' AS channel_scope,
+    -- Tag the summary with the report end month so Looker's default current
+    -- date filter does not hide it. The true cohort dates are separate fields.
     DATE_TRUNC((SELECT ds_end FROM params), MONTH) AS month,
-    COALESCE(s.channel, m.channel) AS channel,
+    w.cohort_start_month,
+    w.cohort_end_month,
+    w.observation_window_end,
+    w.loaded_cohort_month_count,
+    CASE
+      WHEN w.loaded_cohort_month_count = 6 THEN 'complete'
+      ELSE 'partial_backfill'
+    END AS cohort_window_status,
+    s.channel,
     COALESCE(m.users, 0) AS users,
-    COALESCE(s.spend_tl, 0) AS spend_tl,
-    SAFE_DIVIDE(COALESCE(s.spend_tl, 0), COALESCE(m.users, 0)) AS cac_tl,
+    s.spend_tl,
+    SAFE_DIVIDE(s.spend_tl, COALESCE(m.users, 0)) AS cac_tl,
     COALESCE(m.avg_realized_ltv_tl, 0) AS avg_realized_ltv_tl,
     COALESCE(m.median_realized_ltv_tl, 0) AS median_realized_ltv_tl,
     COALESCE(m.total_realized_ltv_tl, 0) AS total_realized_ltv_tl,
-    SAFE_DIVIDE(COALESCE(m.avg_realized_ltv_tl, 0), SAFE_DIVIDE(COALESCE(s.spend_tl, 0), COALESCE(m.users, 0))) AS ltv_cac_ratio,
+    COALESCE(m.avg_payment_count_3m, 0) AS avg_payment_count_3m,
+    SAFE_DIVIDE(
+      COALESCE(m.avg_realized_ltv_tl, 0),
+      SAFE_DIVIDE(s.spend_tl, COALESCE(m.users, 0))
+    ) AS ltv_cac_ratio,
     CASE
-      WHEN COALESCE(s.spend_tl, 0) > 0 AND COALESCE(m.users, 0) > 0 THEN 'ok'
-      WHEN COALESCE(s.spend_tl, 0) > 0 AND COALESCE(m.users, 0) = 0 THEN 'spend_var_user_yok'
-      WHEN COALESCE(s.spend_tl, 0) = 0 AND COALESCE(m.users, 0) > 0 THEN 'spend_yok_user_var'
-      ELSE 'spend_yok_user_yok'
+      WHEN s.spend_tl > 0 AND COALESCE(m.users, 0) > 0 THEN 'ok'
+      WHEN s.spend_tl > 0 AND COALESCE(m.users, 0) = 0 THEN 'spend_var_user_yok'
+      ELSE 'spend_yok'
     END AS cac_status
   FROM selected_spend s
-  FULL OUTER JOIN selected_channel_user_metrics m
+  LEFT JOIN selected_channel_user_metrics m
     ON s.channel = m.channel
+  CROSS JOIN selected_window w
 )
 
-SELECT *
-FROM monthly_channel_final
-
-UNION ALL
-
-SELECT *
+SELECT
+  *,
+  -- Diagnostic field: this must be identical to ltv_cac_ratio.
+  SAFE_DIVIDE(avg_realized_ltv_tl, cac_tl) AS ratio_formula_check
 FROM selected_channel_final
-
-ORDER BY channel_scope, month, channel;
+ORDER BY channel;

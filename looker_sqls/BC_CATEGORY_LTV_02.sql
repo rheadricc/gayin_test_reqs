@@ -18,11 +18,11 @@ contents AS (
 ),
 
 payment_option_config AS (
-  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate, 0.20 AS tax_rate UNION ALL
-  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate, 0.20 AS tax_rate
+  SELECT 'APP_STORE'      AS payment_option, 0.30 AS commission_rate UNION ALL
+  SELECT 'PLAY_STORE'     AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'MOBILE_PAYMENT' AS payment_option, 0.15 AS commission_rate UNION ALL
+  SELECT 'CRAFTGATE'      AS payment_option, 0.00 AS commission_rate UNION ALL
+  SELECT 'IYZICO'         AS payment_option, 0.03 AS commission_rate
 ),
 
 tcmb_rates AS (
@@ -49,7 +49,7 @@ base_payments AS (
   WHERE s.user_id IS NOT NULL
     AND s.payment_option IS NOT NULL
     AND s.payment_option != 'PREPAID'
-    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 0
+    AND COALESCE(s.amount, s.amount_before_promotions, 0) > 101
 ),
 
 payment_rate_candidates AS (
@@ -114,8 +114,7 @@ net_payments AS (
     p.user_id,
     p.payment_date,
     p.amount_gross_tl
-      * (1.0 - COALESCE(c.commission_rate, 0.00))
-      * (1.0 - COALESCE(c.tax_rate, 0.20)) AS net_payment_tl
+      * (1.0 - COALESCE(c.commission_rate, 0.00)) AS net_payment_tl
   FROM dedup_payments p
   LEFT JOIN payment_option_config c
     ON p.payment_option = c.payment_option

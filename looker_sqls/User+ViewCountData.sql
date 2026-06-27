@@ -38,7 +38,11 @@ aggregated AS (
     b.event_date,
     b.video_id,
     COUNT(DISTINCT b.user_id) AS user_cnt,
-    COUNT(DISTINCT CONCAT(b.user_id, b.video_id, b.ga_session_id)) AS view_cnt
+    COUNT(DISTINCT CONCAT(
+      CAST(b.user_id AS STRING), '|',
+      CAST(b.video_id AS STRING), '|',
+      IFNULL(CAST(b.ga_session_id AS STRING), 'no_session')
+    )) AS view_cnt
   FROM base b
   GROUP BY 1,2
 )
